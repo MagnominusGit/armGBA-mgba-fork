@@ -91,6 +91,12 @@ void GBTimerDivReset(struct GBTimer* timer) {
 	mTimingSchedule(&timer->p->timing, &timer->event, timer->nextDiv - ((timer->p->cpu->executionState + 1) & 3) * tMultiplier);
 }
 
+// The system counter now, in ticks of the CPU clock; internalDiv lags it while steps are batched
+uint16_t GBTimerCounter(const struct GBTimer* timer) {
+	int32_t elapsed = timer->nextDiv - mTimingUntil(&timer->p->timing, &timer->event);
+	return (timer->internalDiv << 4) + elapsed / (2 - timer->p->doubleSpeed);
+}
+
 uint8_t GBTimerUpdateTAC(struct GBTimer* timer, GBRegisterTAC tac) {
 	int tMultiplier = 2 - timer->p->doubleSpeed;
 	timer->nextDiv -= mTimingUntil(&timer->p->timing, &timer->event);

@@ -714,10 +714,21 @@ void GBReset(struct SM83Core* cpu) {
 	GBSavedataUnmask(gb);
 }
 
+// The SGB boot ROM sends the header to the SNES, and each clear bit takes an M-cycle longer than a set one
+static uint16_t _sgbBootCounter(struct GB* gb) {
+	unsigned zeros = 0;
+	unsigned i;
+	for (i = 0x104; i < 0x150; ++i) {
+		zeros += 8 - popcount32(gb->memory.rom[i]);
+	}
+	return 0xD308 + zeros * 4;
+}
+
 void GBSkipBIOS(struct GB* gb) {
 	struct SM83Core* cpu = gb->cpu;
 	const struct GBCartridge* cart = (const struct GBCartridge*) &gb->memory.rom[0x100];
-	int nextDiv = 0;
+	// The system counter as the boot ROM leaves it, a T-cycle a step; DIV is its high byte
+	uint16_t counter = 0;
 
 	switch (gb->model) {
 	case GB_MODEL_AUTODETECT: // Silence warnings
@@ -730,8 +741,7 @@ void GBSkipBIOS(struct GB* gb) {
 		cpu->e = 0xD8;
 		cpu->h = 1;
 		cpu->l = 0x4D;
-		gb->timer.internalDiv = 0xABC;
-		nextDiv = 4;
+		counter = 0xABCC;
 		break;
 	case GB_MODEL_SGB:
 		cpu->a = 1;
@@ -740,8 +750,7 @@ void GBSkipBIOS(struct GB* gb) {
 		cpu->e = 0x00;
 		cpu->h = 0xC0;
 		cpu->l = 0x60;
-		gb->timer.internalDiv = 0xD85;
-		nextDiv = 8;
+		counter = _sgbBootCounter(gb);
 		break;
 	case GB_MODEL_MGB:
 		cpu->a = 0xFF;
@@ -750,8 +759,7 @@ void GBSkipBIOS(struct GB* gb) {
 		cpu->e = 0xD8;
 		cpu->h = 1;
 		cpu->l = 0x4D;
-		gb->timer.internalDiv = 0xABC;
-		nextDiv = 4;
+		counter = 0xABCC;
 		break;
 	case GB_MODEL_SGB2:
 		cpu->a = 0xFF;
@@ -760,8 +768,7 @@ void GBSkipBIOS(struct GB* gb) {
 		cpu->e = 0x00;
 		cpu->h = 0xC0;
 		cpu->l = 0x60;
-		gb->timer.internalDiv = 0xD84;
-		nextDiv = 8;
+		counter = _sgbBootCounter(gb) - 0x10;
 		break;
 	case GB_MODEL_AGB:
 		cpu->b = 1;
@@ -780,11 +787,11 @@ void GBSkipBIOS(struct GB* gb) {
 			cpu->d = 0xFF;
 			cpu->e = 0x56;
 			cpu->l = 0x0D;
-			gb->timer.internalDiv = 0x2F0;
+			counter = 0x2F78;
 		} else {
 			cpu->e = 0x08;
 			cpu->l = 0x7C;
-			gb->timer.internalDiv = 0x260;
+			counter = 0x2678;
 			gb->model = GB_MODEL_DMG;
 			gb->memory.io[GB_REG_KEY1] = 0xFF;
 			gb->memory.io[GB_REG_BCPS] = 0x88; // Faked writing 4 BG palette entries
@@ -793,7 +800,10 @@ void GBSkipBIOS(struct GB* gb) {
 			GBVideoDisableCGB(&gb->video);
 		}
 		memcpy(gb->memory.hram, _cgbBiosHram, sizeof(gb->memory.hram));
-		nextDiv = 0xC;
+		if (cpu->b) {
+			// The AGB boot ROM runs a little longer
+			counter += 4;
+		}
 		break;
 	}
 
@@ -839,10 +849,12 @@ void GBSkipBIOS(struct GB* gb) {
 	cpu->sp = 0xFFFE;
 	cpu->pc = 0x100;
 
-	gb->timer.nextDiv = GB_DMG_DIV_PERIOD * (16 - nextDiv);
+	gb->timer.internalDiv = counter >> 4;
+	gb->memory.io[GB_REG_DIV] = counter >> 8;
+	gb->timer.nextDiv = GB_DMG_DIV_PERIOD * 2;
 
 	mTimingDeschedule(&gb->timing, &gb->timer.event);
-	mTimingSchedule(&gb->timing, &gb->timer.event, gb->timer.nextDiv);
+	mTimingSchedule(&gb->timing, &gb->timer.event, (GB_DMG_DIV_PERIOD - (counter & 15)) * 2);
 
 	if (gb->biosVf) {
 		GBUnmapBIOS(gb);

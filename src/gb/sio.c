@@ -92,8 +92,10 @@ void GBSIOWriteSC(struct GBSIO* sio, uint8_t sc) {
 	sio->period = GBSIOCyclesPerTransfer[GBRegisterSCGetClockSpeed(sc)]; // TODO Shift Clock
 	if (GBRegisterSCIsEnable(sc)) {
 		if (GBRegisterSCIsShiftClock(sc)) {
+			// The serial clock is divided from the system counter, so bits shift on its edges, not from this write
+			int ticks = sio->period - (GBTimerCounter(&sio->p->timer) & (sio->period - 1));
 			mTimingDeschedule(&sio->p->timing, &sio->event);
-			mTimingSchedule(&sio->p->timing, &sio->event, sio->period * (2 - sio->p->doubleSpeed));
+			mTimingSchedule(&sio->p->timing, &sio->event, ticks * (2 - sio->p->doubleSpeed));
 			sio->remainingBits = 8;
 		}
 	} else {
