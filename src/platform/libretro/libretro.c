@@ -17,6 +17,7 @@
 #ifdef M_CORE_GB
 #include <mgba/gb/core.h>
 #include <mgba/internal/gb/gb.h>
+#include <mgba/internal/gb/io.h>
 #include <mgba/internal/gb/mbc.h>
 #include <mgba/internal/gb/overrides.h>
 #endif
@@ -89,6 +90,25 @@ static void _setupMaps(struct mCore* core);
 
 static struct mCore* core;
 static mColor* outputBuffer = NULL;
+
+#ifdef M_CORE_GB
+// Game Boy games shown the way a Game Boy Advance shows them
+#define GB_ON_GBA_WIDTH 240
+#define GB_ON_GBA_HEIGHT 160
+static bool gbaMode = false;
+static bool gbaStretch = false;
+static bool gbaShoulderHeld = false;
+static unsigned gbaPaletteFrames = 0;
+static mColor gbaScreen[GB_ON_GBA_WIDTH * GB_ON_GBA_HEIGHT];
+// Bits of the keys passed to the core, in keymap order
+enum {
+	KEY_BIT_A = 0,
+	KEY_BIT_B = 1,
+	KEY_BIT_RIGHT = 4,
+	KEY_BIT_R = 8,
+	KEY_BIT_L = 9,
+};
+#endif
 
 #ifdef M_CORE_GBA
 // Drawing on the GPU: the batch renderer fills the frontend's framebuffer
@@ -599,6 +619,12 @@ static void _loadColorCorrectionSettings(void) {
 			ccType = 3;
 		}
 	}
+
+#ifdef M_CORE_GB
+	if (gbaMode && core->platform(core) == mPLATFORM_GB) {
+		ccType = 1;
+	}
+#endif
 
 	if (ccType == 0) {
 		colorCorrectionEnabled = false;
@@ -1210,7 +1236,11 @@ static void _updateGbPal(void) {
 	struct retro_variable var;
 	var.key = "mgba_gb_colors";
 	var.value = 0;
-	if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+	if (gbaMode) {
+		// The boot ROM's palette for games it doesn't know, the Right + A one
+		var.value = "GBC Dark Green →A";
+	}
+	if (var.value || (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)) {
 		const struct GBColorPreset* presets;
 		size_t listSize = GBColorPresetList(&presets);
 		size_t i;
@@ -1284,6 +1314,21 @@ static void _reloadSettings(void) {
 	if (environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
 		mCoreConfigSetDefaultIntValue(&core->config, "gb.colors", strtol(var.value, NULL, 10));
 	}
+
+	var.key = "mgba_gb_gba_mode";
+	var.value = 0;
+	gbaMode = environCallback(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && strcmp(var.value, "ON") == 0;
+	if (gbaMode) {
+		modelName = GBModelToName(GB_MODEL_AGB);
+		mCoreConfigSetDefaultValue(&core->config, "gb.model", modelName);
+		mCoreConfigSetDefaultValue(&core->config, "sgb.model", modelName);
+		mCoreConfigSetDefaultValue(&core->config, "cgb.model", modelName);
+		mCoreConfigSetDefaultValue(&core->config, "cgb.hybridModel", modelName);
+		mCoreConfigSetDefaultValue(&core->config, "cgb.sgbModel", modelName);
+		mCoreConfigSetDefaultIntValue(&core->config, "sgb.borders", 0);
+		mCoreConfigSetDefaultIntValue(&core->config, "gb.colors", GB_COLORS_CGB);
+	}
+	gbaPaletteFrames = gbaMode ? 120 : 0;
 
 	_updateGbPal();
 #endif
@@ -1446,6 +1491,15 @@ void retro_get_system_av_info(struct retro_system_av_info* info) {
 	core->baseVideoSize(core, &width, &height);
 	info->geometry.max_width = width;
 	info->geometry.max_height = height;
+#ifdef M_CORE_GB
+	if (gbaMode && core->platform(core) == mPLATFORM_GB) {
+		info->geometry.base_width = GB_ON_GBA_WIDTH;
+		info->geometry.base_height = GB_ON_GBA_HEIGHT;
+		info->geometry.aspect_ratio = GB_ON_GBA_WIDTH / (double) GB_ON_GBA_HEIGHT;
+		info->geometry.max_width = width > GB_ON_GBA_WIDTH ? width : GB_ON_GBA_WIDTH;
+		info->geometry.max_height = height > GB_ON_GBA_HEIGHT ? height : GB_ON_GBA_HEIGHT;
+	}
+#endif
 
 	info->timing.fps = core->frequency(core) / (float) core->frameCycles(core);
 
@@ -1643,6 +1697,77 @@ static void _setFastForward(bool fastForward) {
 	fastForwarding = fastForward;
 }
 
+#ifdef M_CORE_GB
+#if defined(COLOR_16_BIT) && defined(COLOR_5_6_5)
+#define BLEND_MASK 0xF7DE
+#else
+#define BLEND_MASK 0xFEFEFE
+#endif
+
+// 160x144 in the middle of the GBA screen, or stretched to 240x144 with each pair of pixels becoming three, the middle one a blend
+static void _composeGbOnGba(const mColor* src, size_t stride) {
+	memset(gbaScreen, 0, sizeof(gbaScreen));
+	unsigned y;
+	for (y = 0; y < GB_VIDEO_VERTICAL_PIXELS; ++y) {
+		const mColor* in = &src[y * stride];
+		mColor* out = &gbaScreen[(y + 8) * GB_ON_GBA_WIDTH];
+		if (!gbaStretch) {
+			memcpy(&out[40], in, GB_VIDEO_HORIZONTAL_PIXELS * sizeof(mColor));
+			continue;
+		}
+		unsigned x;
+		for (x = 0; x < GB_VIDEO_HORIZONTAL_PIXELS; x += 2) {
+			mColor a = in[x];
+			mColor b = in[x + 1];
+			*out++ = a;
+			*out++ = ((a & BLEND_MASK) + (b & BLEND_MASK)) >> 1;
+			*out++ = b;
+		}
+	}
+}
+
+// With no boot ROM to show the logo, a direction held as the game starts picks the palette the GBA boot ROM would
+static void _pickGbaBootPalette(uint16_t keys) {
+	static const char* const names[4][3] = {
+		{ "GBC Green →", "GBC Dark Green →A", "GBC Reverse →B" },
+		{ "GBC Blue ←", "GBC Dark Blue ←A", "GBC Gray ←B" },
+		{ "GBC Brown ↑", "GBC Red ↑A", "GBC Dark Brown ↑B" },
+		{ "GBC Pale Yellow ↓", "GBC Orange ↓A", "GBC Yellow ↓B" },
+	};
+	struct GB* gb = core->board;
+	if (gb->biosVf || gb->model >= GB_MODEL_CGB) {
+		gbaPaletteFrames = 0;
+		return;
+	}
+	int direction;
+	for (direction = 0; direction < 4; ++direction) {
+		if (keys & (1 << (KEY_BIT_RIGHT + direction))) {
+			break;
+		}
+	}
+	if (direction == 4) {
+		return;
+	}
+	int button = (keys & (1 << KEY_BIT_A)) ? 1 : (keys & (1 << KEY_BIT_B)) ? 2 : 0;
+	const struct GBColorPreset* presets;
+	size_t listSize = GBColorPresetList(&presets);
+	size_t i;
+	for (i = 0; i < listSize; ++i) {
+		if (strcmp(presets[i].name, names[direction][button]) == 0) {
+			int c;
+			for (c = 0; c < 12; ++c) {
+				GBVideoSetPalette(&gb->video, c, presets[i].colors[c]);
+			}
+			GBIOWrite(gb, GB_REG_BGP, gb->memory.io[GB_REG_BGP]);
+			GBIOWrite(gb, GB_REG_OBP0, gb->memory.io[GB_REG_OBP0]);
+			GBIOWrite(gb, GB_REG_OBP1, gb->memory.io[GB_REG_OBP1]);
+			break;
+		}
+	}
+	gbaPaletteFrames = 0;
+}
+#endif
+
 void retro_run(void) {
 	if (deferredSetup) {
 		_doDeferredSetup();
@@ -1706,6 +1831,19 @@ void retro_run(void) {
 		);
 	}
 	core->setKeys(core, keys);
+#ifdef M_CORE_GB
+	if (gbaMode && core->platform(core) == mPLATFORM_GB) {
+		bool shoulder = keys & ((1 << KEY_BIT_L) | (1 << KEY_BIT_R));
+		if (shoulder && !gbaShoulderHeld) {
+			gbaStretch = !gbaStretch;
+		}
+		gbaShoulderHeld = shoulder;
+		if (gbaPaletteFrames) {
+			--gbaPaletteFrames;
+			_pickGbaBootPalette(keys);
+		}
+	}
+#endif
 	if (useFastForward && fastForwarding != (l2 || r2)) {
 		_setFastForward(l2 || r2);
 	}
@@ -1821,15 +1959,28 @@ void retro_run(void) {
 		const void* pixels;
 		size_t stride;
 		core->getPixels(core, &pixels, &stride);
+		const mColor* frame = outputBuffer;
 #if defined(COLOR_16_BIT) && defined(COLOR_5_6_5)
 		if (videoPostProcess) {
 			videoPostProcess(width, height);
-			videoCallback(ppOutputBuffer, width, height, VIDEO_WIDTH_MAX * sizeof(mColor));
+			frame = ppOutputBuffer;
+		}
+#endif
+#ifdef M_CORE_GB
+		if (gbaMode && core->platform(core) == mPLATFORM_GB && width == GB_VIDEO_HORIZONTAL_PIXELS && height == GB_VIDEO_VERTICAL_PIXELS) {
+			_composeGbOnGba(frame, VIDEO_WIDTH_MAX);
+			videoCallback(gbaScreen, GB_ON_GBA_WIDTH, GB_ON_GBA_HEIGHT, GB_ON_GBA_WIDTH * sizeof(mColor));
 		} else
 #endif
-			videoCallback(outputBuffer, width, height, VIDEO_WIDTH_MAX * sizeof(mColor));
+			videoCallback(frame, width, height, VIDEO_WIDTH_MAX * sizeof(mColor));
 		}
 	} else {
+#ifdef M_CORE_GB
+		if (gbaMode && core->platform(core) == mPLATFORM_GB) {
+			width = GB_ON_GBA_WIDTH;
+			height = GB_ON_GBA_HEIGHT;
+		}
+#endif
 		videoCallback(NULL, width, height, VIDEO_WIDTH_MAX * sizeof(mColor));
 	}
 
@@ -2061,6 +2212,9 @@ static void _setupMaps(struct mCore* core) {
 
 void retro_reset(void) {
 	core->reset(core);
+#ifdef M_CORE_GB
+	gbaPaletteFrames = gbaMode ? 120 : 0;
+#endif
 	mRumbleIntegratorReset(&rumble);
 	_setupMaps(core);
 }

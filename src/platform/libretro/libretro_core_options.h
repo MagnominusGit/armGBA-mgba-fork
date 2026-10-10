@@ -130,6 +130,20 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "OFF"
    },
    {
+      "mgba_gb_gba_mode",
+      "Game Boy Advance Mode (Restart)",
+      NULL,
+      "Plays Game Boy and Game Boy Color games the way a Game Boy Advance does: Game Boy Advance hardware and screen colors, L and R switching between the original picture and the stretched widescreen, and for Game Boy games the boot palettes, picked by holding a direction (with A or B) while the game starts.",
+      NULL,
+      "system",
+      {
+         { "OFF", "disabled" },
+         { "ON",  "enabled" },
+         { NULL, NULL },
+      },
+      "OFF"
+   },
+   {
       "mgba_gb_colors",
       "Default Game Boy Palette",
       NULL,
