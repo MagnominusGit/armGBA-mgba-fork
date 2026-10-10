@@ -580,6 +580,11 @@ void GBMemoryDMA(struct GB* gb, uint16_t base) {
 }
 
 uint8_t GBMemoryWriteHDMA5(struct GB* gb, uint8_t value) {
+	if (gb->memory.isHdma && !(value & 0x80)) {
+		// Clearing bit 7 pauses a running HBlank DMA, keeping the length written
+		gb->memory.isHdma = false;
+		return value | 0x80;
+	}
 	gb->memory.hdmaSource = gb->memory.io[GB_REG_HDMA1] << 8;
 	gb->memory.hdmaSource |= gb->memory.io[GB_REG_HDMA2];
 	gb->memory.hdmaDest = gb->memory.io[GB_REG_HDMA3] << 8;
