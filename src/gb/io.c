@@ -498,6 +498,17 @@ void GBIOWrite(struct GB* gb, unsigned address, uint8_t value) {
 			}
 			goto success;
 		}
+		if (gb->audio.style == GB_AUDIO_CGB) {
+			// A CGB running a DMG game still has these
+			switch (address) {
+			case GB_REG_PSWX:
+			case GB_REG_PSWY:
+			case GB_REG_UNK75:
+				goto success;
+			default:
+				break;
+			}
+		}
 		failed:
 		mLOG(GB_IO, GAME_ERROR, "Writing to unknown register FF%02X:%02X", address, value);
 		return;
