@@ -334,6 +334,7 @@ struct GBMemory {
 	uint16_t dmaSource;
 	uint16_t dmaDest;
 	int dmaRemaining;
+	bool dmaStarting;
 
 	uint16_t hdmaSource;
 	uint16_t hdmaDest;

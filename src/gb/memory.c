@@ -54,6 +54,14 @@ static const uint8_t _blockedRegion[1] = { 0xFF };
 
 static void _pristineCow(struct GB* gba);
 
+// A new transfer takes over the bus from the M-cycle of its first copy
+static bool _dmaBlocking(struct GB* gb) {
+	if (!gb->memory.dmaRemaining) {
+		return false;
+	}
+	return !gb->memory.dmaStarting || (int32_t) (mTimingCurrentTime(&gb->timing) - gb->memory.dmaEvent.when) >= 0;
+}
+
 uint8_t GBCartLoad8(struct SM83Core* cpu, uint16_t address) {
 	if (UNLIKELY(address >= cpu->memory.activeRegionEnd)) {
 		cpu->memory.setActiveRegion(cpu, address);
@@ -129,7 +137,7 @@ static void GBSetActiveRegion(struct SM83Core* cpu, uint16_t address) {
 		gb->memory.cartBus = 0xFF;
 		break;
 	}
-	if (gb->memory.dmaRemaining) {
+	if (_dmaBlocking(gb)) {
 		const enum GBBus* block = gb->model < GB_MODEL_CGB ? _oamBlockDMG : _oamBlockCGB;
 		enum GBBus dmaBus = block[memory->dmaSource >> 13];
 		enum GBBus accessBus = block[address >> 13];
@@ -212,6 +220,7 @@ void GBMemoryReset(struct GB* gb) {
 	gb->memory.ie = 0;
 
 	gb->memory.dmaRemaining = 0;
+	gb->memory.dmaStarting = false;
 	gb->memory.dmaSource = 0;
 	gb->memory.dmaDest = 0;
 	gb->memory.hdmaRemaining = 0;
@@ -247,7 +256,7 @@ void GBMemorySwitchWramBank(struct GBMemory* memory, int bank) {
 uint8_t GBLoad8(struct SM83Core* cpu, uint16_t address) {
 	struct GB* gb = (struct GB*) cpu->master;
 	struct GBMemory* memory = &gb->memory;
-	if (gb->memory.dmaRemaining) {
+	if (_dmaBlocking(gb)) {
 		const enum GBBus* block = gb->model < GB_MODEL_CGB ? _oamBlockDMG : _oamBlockCGB;
 		enum GBBus dmaBus = block[memory->dmaSource >> 13];
 		enum GBBus accessBus = block[address >> 13];
@@ -350,7 +359,7 @@ uint8_t GBLoad8(struct SM83Core* cpu, uint16_t address) {
 void GBStore8(struct SM83Core* cpu, uint16_t address, int8_t value) {
 	struct GB* gb = (struct GB*) cpu->master;
 	struct GBMemory* memory = &gb->memory;
-	if (gb->memory.dmaRemaining) {
+	if (_dmaBlocking(gb)) {
 		const enum GBBus* block = gb->model < GB_MODEL_CGB ? _oamBlockDMG : _oamBlockCGB;
 		enum GBBus dmaBus = block[memory->dmaSource >> 13];
 		enum GBBus accessBus = block[address >> 13];
@@ -563,6 +572,8 @@ void GBMemoryDMA(struct GB* gb, uint16_t base) {
 	}
 	mTimingDeschedule(&gb->timing, &gb->memory.dmaEvent);
 	mTimingSchedule(&gb->timing, &gb->memory.dmaEvent, 8 * (2 - gb->doubleSpeed));
+	// OAM stays open until a new transfer copies its first byte, unless one is already running
+	gb->memory.dmaStarting = !gb->memory.dmaRemaining;
 	gb->memory.dmaSource = base;
 	gb->memory.dmaDest = 0;
 	gb->memory.dmaRemaining = 0xA0;
@@ -598,6 +609,7 @@ void _GBMemoryDMAService(struct mTiming* timing, void* context, uint32_t cyclesL
 	struct GB* gb = context;
 	int dmaRemaining = gb->memory.dmaRemaining;
 	gb->memory.dmaRemaining = 0;
+	gb->memory.dmaStarting = false;
 	enum mMemoryAccessSource oldAccess = gb->cpu->memory.accessSource;
 	gb->cpu->memory.accessSource = mACCESS_DMA;
 	uint8_t b = GBLoad8(gb->cpu, gb->memory.dmaSource);
@@ -777,6 +789,7 @@ void GBMemorySerialize(const struct GB* gb, struct GBSerializedState* state) {
 	flags = GBSerializedMemoryFlagsSetIme(flags, memory->ime);
 	flags = GBSerializedMemoryFlagsSetIsHdma(flags, memory->isHdma);
 	flags = GBSerializedMemoryFlagsSetActiveRtcReg(flags, memory->activeRtcReg);
+	flags = GBSerializedMemoryFlagsSetDmaStarting(flags, memory->dmaStarting);
 	STORE_16LE(flags, 0, &state->memory.flags);
 
 	state->memory.cartBus = memory->cartBus;
@@ -931,6 +944,7 @@ void GBMemoryDeserialize(struct GB* gb, const struct GBSerializedState* state) {
 	memory->ime = GBSerializedMemoryFlagsGetIme(flags);
 	memory->isHdma = GBSerializedMemoryFlagsGetIsHdma(flags);
 	memory->activeRtcReg = GBSerializedMemoryFlagsGetActiveRtcReg(flags);
+	memory->dmaStarting = GBSerializedMemoryFlagsGetDmaStarting(flags);
 
 	memory->cartBus = state->memory.cartBus;
 	LOAD_16LE(memory->cartBusPc, 0, &state->cartBusPc);

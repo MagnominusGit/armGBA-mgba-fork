@@ -290,6 +290,7 @@ DECL_BIT(GBSerializedMemoryFlags, RtcLatched, 2);
 DECL_BIT(GBSerializedMemoryFlags, Ime, 3);
 DECL_BIT(GBSerializedMemoryFlags, IsHdma, 4);
 DECL_BITS(GBSerializedMemoryFlags, ActiveRtcReg, 5, 3);
+DECL_BIT(GBSerializedMemoryFlags, DmaStarting, 8);
 
 DECL_BITFIELD(GBSerializedSGBFlags, uint32_t);
 DECL_BITS(GBSerializedSGBFlags, P1Bits, 0, 2);
