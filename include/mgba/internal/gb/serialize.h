@@ -256,6 +256,7 @@ DECL_BIT(GBSerializedCpuFlags, DoubleSpeed, 2);
 DECL_BIT(GBSerializedCpuFlags, EiPending, 3);
 DECL_BIT(GBSerializedCpuFlags, Halted, 4);
 DECL_BIT(GBSerializedCpuFlags, Blocked, 5);
+DECL_BIT(GBSerializedCpuFlags, SpeedSwitching, 6);
 
 DECL_BITFIELD(GBSerializedTimerFlags, uint8_t);
 DECL_BIT(GBSerializedTimerFlags, IrqPending, 0);
@@ -333,7 +334,7 @@ struct GBSerializedState {
 		uint16_t reserved;
 
 		uint32_t eiPending;
-		int32_t reservedDiPending;
+		int32_t speedSwitch;
 		GBSerializedCpuFlags flags;
 	} cpu;
 

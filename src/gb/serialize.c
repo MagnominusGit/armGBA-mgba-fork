@@ -55,8 +55,10 @@ void GBSerialize(struct GB* gb, struct GBSerializedState* state) {
 	flags = GBSerializedCpuFlagsSetEiPending(flags, mTimingIsScheduled(&gb->timing, &gb->eiPending));
 	flags = GBSerializedCpuFlagsSetHalted(flags, gb->cpu->halted);
 	flags = GBSerializedCpuFlagsSetBlocked(flags, gb->cpuBlocked);
+	flags = GBSerializedCpuFlagsSetSpeedSwitching(flags, mTimingIsScheduled(&gb->timing, &gb->speedSwitch));
 	STORE_32LE(flags, 0, &state->cpu.flags);
 	STORE_32LE(gb->eiPending.when - mTimingCurrentTime(&gb->timing), 0, &state->cpu.eiPending);
+	STORE_32LE(gb->speedSwitch.when - mTimingCurrentTime(&gb->timing), 0, &state->cpu.speedSwitch);
 
 	GBMemorySerialize(gb, state);
 	GBIOSerialize(gb, state);
@@ -193,6 +195,10 @@ bool GBDeserialize(struct GB* gb, const struct GBSerializedState* state) {
 		mTimingSchedule(&gb->timing, &gb->eiPending, when);
 	} else {
 		gb->eiPending.when = when + mTimingCurrentTime(&gb->timing);
+	}
+	LOAD_32LE(when, 0, &state->cpu.speedSwitch);
+	if (GBSerializedCpuFlagsIsSpeedSwitching(flags)) {
+		mTimingSchedule(&gb->timing, &gb->speedSwitch, when);
 	}
 
 	gb->model = state->model;

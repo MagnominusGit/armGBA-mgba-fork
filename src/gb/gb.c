@@ -76,6 +76,7 @@ static void GBIllegal(struct SM83Core* cpu);
 static void GBStop(struct SM83Core* cpu);
 
 static void _enableInterrupts(struct mTiming* timing, void* user, uint32_t cyclesLate);
+static void _endSpeedSwitch(struct mTiming* timing, void* user, uint32_t cyclesLate);
 
 void GBCreate(struct GB* gb) {
 	gb->d.id = GB_COMPONENT_MAGIC;
@@ -126,6 +127,10 @@ static void GBInit(void* cpu, struct mCPUComponent* component) {
 	gb->eiPending.callback = _enableInterrupts;
 	gb->eiPending.context = gb;
 	gb->eiPending.priority = 0;
+	gb->speedSwitch.name = "GB Speed Switch";
+	gb->speedSwitch.callback = _endSpeedSwitch;
+	gb->speedSwitch.context = gb;
+	gb->speedSwitch.priority = 0x50;
 }
 
 static void GBDeinit(struct mCPUComponent* component) {
@@ -787,7 +792,7 @@ void GBSkipBIOS(struct GB* gb) {
 			cpu->d = 0xFF;
 			cpu->e = 0x56;
 			cpu->l = 0x0D;
-			counter = 0x2F78;
+			counter = 0x1EA0;
 		} else {
 			cpu->e = 0x08;
 			cpu->l = 0x7C;
@@ -985,6 +990,7 @@ void GBUpdateIRQs(struct GB* gb) {
 		return;
 	}
 	gb->cpu->halted = false;
+	mTimingDeschedule(&gb->timing, &gb->speedSwitch);
 
 	if (!gb->memory.ime) {
 		gb->cpu->irqPending = false;
@@ -1087,6 +1093,13 @@ uint16_t GBIRQVector(struct SM83Core* cpu) {
 	return 0;
 }
 
+static void _endSpeedSwitch(struct mTiming* timing, void* user, uint32_t cyclesLate) {
+	UNUSED(timing);
+	UNUSED(cyclesLate);
+	struct GB* gb = user;
+	gb->cpu->halted = false;
+}
+
 static void _enableInterrupts(struct mTiming* timing, void* user, uint32_t cyclesLate) {
 	UNUSED(timing);
 	UNUSED(cyclesLate);
@@ -1112,11 +1125,19 @@ void GBHalt(struct SM83Core* cpu) {
 
 void GBStop(struct SM83Core* cpu) {
 	struct GB* gb = (struct GB*) cpu->master;
+	GBTimerDivReset(&gb->timer);
 	if (gb->model >= GB_MODEL_CGB && gb->memory.io[GB_REG_KEY1] & 1) {
 		gb->doubleSpeed ^= 1;
 		gb->cpu->tMultiplier = 2 - gb->doubleSpeed;
 		gb->memory.io[GB_REG_KEY1] = 0;
 		gb->memory.io[GB_REG_KEY1] |= gb->doubleSpeed << 7;
+		if (!(gb->memory.ie & gb->memory.io[GB_REG_IF] & 0x1F)) {
+			// The CPU stays stopped while the clock settles, unless an interrupt wakes it
+			mTimingSchedule(&gb->timing, &gb->speedSwitch, 0x20008 * gb->cpu->tMultiplier);
+			_GBAdvanceCycles(gb);
+			cpu->executionState = (cpu->executionState - 1) & 3;
+			cpu->halted = true;
+		}
 	} else {
 		int sleep = ~(gb->memory.io[GB_REG_JOYP] & 0x30);
 		size_t c;

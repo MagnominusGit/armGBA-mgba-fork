@@ -131,6 +131,7 @@ struct GB {
 	bool cpuBlocked;
 	bool earlyExit;
 	struct mTimingEvent eiPending;
+	struct mTimingEvent speedSwitch;
 	unsigned doubleSpeed;
 
 	bool allowOpposingDirections;
