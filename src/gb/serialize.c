@@ -65,6 +65,7 @@ void GBSerialize(struct GB* gb, struct GBSerializedState* state) {
 	GBVideoSerialize(&gb->video, state);
 	GBTimerSerialize(&gb->timer, state);
 	GBAudioSerialize(&gb->audio, state);
+	GBApuSerialize(gb, state);
 
 	if (gb->model & GB_MODEL_SGB) {
 		GBSGBSerialize(gb, state);
@@ -219,6 +220,7 @@ bool GBDeserialize(struct GB* gb, const struct GBSerializedState* state) {
 	GBIODeserialize(gb, state);
 	GBTimerDeserialize(&gb->timer, state);
 	GBAudioDeserialize(&gb->audio, state);
+	GBApuDeserialize(gb, state);
 
 	if (gb->memory.io[GB_REG_BANK] == 0xFF) {
 		GBMapBIOS(gb);

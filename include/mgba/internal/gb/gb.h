@@ -15,6 +15,7 @@ CXX_GUARD_START
 #include <mgba/core/log.h>
 #include <mgba/core/timing.h>
 
+#include <mgba/internal/gb/apu.h>
 #include <mgba/internal/gb/audio.h>
 #include <mgba/internal/gb/memory.h>
 #include <mgba/internal/gb/sio.h>
@@ -95,6 +96,7 @@ struct GB {
 	struct GBVideo video;
 	struct GBTimer timer;
 	struct GBAudio audio;
+	struct GBApu apu;
 	struct GBSIO sio;
 	enum GBModel model;
 	struct GBXMetadata gbx;

@@ -1,5 +1,6 @@
 include(ExportDirectory)
 set(SOURCE_FILES
+	apu.c
 	audio.c
 	cheats.c
 	core.c

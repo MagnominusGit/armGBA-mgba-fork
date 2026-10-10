@@ -705,6 +705,7 @@ void GBReset(struct SM83Core* cpu) {
 	GBTimerReset(&gb->timer);
 	GBIOReset(gb);
 	GBAudioReset(&gb->audio);
+	GBApuReset(gb);
 	if (!gb->biosVf && gb->memory.rom) {
 		GBSkipBIOS(gb);
 	} else {
@@ -884,6 +885,7 @@ void GBSkipBIOS(struct GB* gb) {
 	GBIOWrite(gb, GB_REG_NR43, 0x00);
 	GBIOWrite(gb, GB_REG_NR50, 0x77);
 	GBIOWrite(gb, GB_REG_NR51, 0xF3);
+	GBApuSkipBIOS(gb);
 	GBIOWrite(gb, GB_REG_LCDC, 0x91);
 	gb->memory.io[GB_REG_BANK] = 0x1;
 	GBVideoSkipBIOS(&gb->video);

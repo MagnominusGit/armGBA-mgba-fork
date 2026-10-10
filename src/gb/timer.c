@@ -31,9 +31,13 @@ static void _GBTimerDivIncrement(struct GBTimer* timer, uint32_t cyclesLate) {
 				mTimingSchedule(&timer->p->timing, &timer->irq, 7 * tMultiplier - ((timer->p->cpu->executionState * tMultiplier - cyclesLate) & (3 * tMultiplier)));
 			}
 		}
-		unsigned timingFactor = (0x200 << timer->p->doubleSpeed) - 1;
-		if ((timer->internalDiv & timingFactor) == timingFactor) {
-			GBAudioUpdateFrame(&timer->p->audio);
+		// The APU steps on the falling edge of counter bit 12 (13 in double speed), envelopes reload on the rising edge
+		unsigned apuMask = (0x200 << timer->p->doubleSpeed) - 1;
+		unsigned apuBits = timer->internalDiv & apuMask;
+		if (apuBits == apuMask) {
+			GBApuDivEvent(timer->p, mTimingCurrentTime(&timer->p->timing) - timer->nextDiv - 1);
+		} else if (apuBits == apuMask >> 1) {
+			GBApuDivSecondaryEvent(timer->p, mTimingCurrentTime(&timer->p->timing) - timer->nextDiv - 1);
 		}
 		++timer->internalDiv;
 		timer->p->memory.io[GB_REG_DIV] = timer->internalDiv >> 4;
@@ -82,8 +86,8 @@ void GBTimerDivReset(struct GBTimer* timer) {
 			mTimingSchedule(&timer->p->timing, &timer->irq, (7 - (timer->p->cpu->executionState & 3)) * tMultiplier);
 		}
 	}
-	if (timer->internalDiv & (0x200 << timer->p->doubleSpeed)) {
-		GBAudioUpdateFrame(&timer->p->audio);
+	if (timer->internalDiv & (0x100 << timer->p->doubleSpeed)) {
+		GBApuDivEvent(timer->p, mTimingCurrentTime(&timer->p->timing));
 	}
 	timer->p->memory.io[GB_REG_DIV] = 0;
 	timer->internalDiv = 0;

@@ -802,8 +802,12 @@ void GBAudioSample(struct GBAudio* audio, int32_t timestamp) {
 	for (sample = audio->sampleIndex; timestamp >= interval && sample < GB_MAX_SAMPLES; ++sample, timestamp -= interval) {
 		int16_t sampleLeft = 0;
 		int16_t sampleRight = 0;
+#ifdef M_CORE_GB
+		GBApuSample(audio->p, sample * interval + audio->lastSample, &sampleLeft, &sampleRight);
+#else
 		GBAudioRun(audio, sample * interval + audio->lastSample, 0x1F);
 		GBAudioSamplePSG(audio, &sampleLeft, &sampleRight);
+#endif
 		sampleLeft = (sampleLeft * audio->masterVolume * 6) >> 7;
 		sampleRight = (sampleRight * audio->masterVolume * 6) >> 7;
 

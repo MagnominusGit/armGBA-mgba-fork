@@ -209,156 +209,26 @@ void GBIOWrite(struct GB* gb, unsigned address, uint8_t value) {
 		GBTimerDivReset(&gb->timer);
 		return;
 	case GB_REG_NR10:
-		if (gb->audio.enable) {
-			GBAudioWriteNR10(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR11:
-		if (gb->audio.enable) {
-			GBAudioWriteNR11(&gb->audio, value);
-		} else {
-			if (gb->audio.style == GB_AUDIO_DMG) {
-				GBAudioWriteNR11(&gb->audio, value & _registerMask[GB_REG_NR11]);
-			}
-			value = 0;
-		}
-		break;
 	case GB_REG_NR12:
-		if (gb->audio.enable) {
-			GBAudioWriteNR12(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR13:
-		if (gb->audio.enable) {
-			GBAudioWriteNR13(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR14:
-		if (gb->audio.enable) {
-			GBAudioWriteNR14(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR21:
-		if (gb->audio.enable) {
-			GBAudioWriteNR21(&gb->audio, value);
-		} else {
-			if (gb->audio.style == GB_AUDIO_DMG) {
-				GBAudioWriteNR21(&gb->audio, value & _registerMask[GB_REG_NR21]);
-			}
-			value = 0;
-		}
-		break;
 	case GB_REG_NR22:
-		if (gb->audio.enable) {
-			GBAudioWriteNR22(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR23:
-		if (gb->audio.enable) {
-			GBAudioWriteNR23(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR24:
-		if (gb->audio.enable) {
-			GBAudioWriteNR24(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR30:
-		if (gb->audio.enable) {
-			GBAudioWriteNR30(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR31:
-		if (gb->audio.enable || gb->audio.style == GB_AUDIO_DMG) {
-			GBAudioWriteNR31(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR32:
-		if (gb->audio.enable) {
-			GBAudioWriteNR32(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR33:
-		if (gb->audio.enable) {
-			GBAudioWriteNR33(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR34:
-		if (gb->audio.enable) {
-			GBAudioWriteNR34(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR41:
-		if (gb->audio.enable || gb->audio.style == GB_AUDIO_DMG) {
-			GBAudioWriteNR41(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR42:
-		if (gb->audio.enable) {
-			GBAudioWriteNR42(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR43:
-		if (gb->audio.enable) {
-			GBAudioWriteNR43(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR44:
-		if (gb->audio.enable) {
-			GBAudioWriteNR44(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR50:
-		if (gb->audio.enable) {
-			GBAudioWriteNR50(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR51:
-		if (gb->audio.enable) {
-			GBAudioWriteNR51(&gb->audio, value);
-		} else {
-			value = 0;
-		}
-		break;
 	case GB_REG_NR52:
-		GBAudioWriteNR52(&gb->audio, value);
-		value &= 0x80;
-		value |= gb->memory.io[GB_REG_NR52] & 0x0F;
-		break;
 	case GB_REG_WAVE_0:
 	case GB_REG_WAVE_1:
 	case GB_REG_WAVE_2:
@@ -375,13 +245,8 @@ void GBIOWrite(struct GB* gb, unsigned address, uint8_t value) {
 	case GB_REG_WAVE_D:
 	case GB_REG_WAVE_E:
 	case GB_REG_WAVE_F:
-		GBAudioRun(&gb->audio, mTimingCurrentTime(gb->audio.timing), 0x4);
-		if (!gb->audio.playingCh3) {
-			gb->audio.ch3.wavedata8[address - GB_REG_WAVE_0] = value;
-		} else if (gb->audio.ch3.readable || gb->audio.style == GB_AUDIO_CGB) {
-			gb->audio.ch3.wavedata8[gb->audio.ch3.window >> 1] = value;
-		}
-		break;
+		GBApuWrite(gb, address, value);
+		return;
 	case GB_REG_JOYP:
 		gb->memory.io[GB_REG_JOYP] = value | 0x0F;
 		_readKeys(gb);
@@ -566,6 +431,7 @@ uint8_t GBIORead(struct GB* gb, unsigned address) {
 		return _readKeysFiltered(gb);
 	case GB_REG_IE:
 		return gb->memory.ie;
+	case GB_REG_NR52:
 	case GB_REG_WAVE_0:
 	case GB_REG_WAVE_1:
 	case GB_REG_WAVE_2:
@@ -582,31 +448,19 @@ uint8_t GBIORead(struct GB* gb, unsigned address) {
 	case GB_REG_WAVE_D:
 	case GB_REG_WAVE_E:
 	case GB_REG_WAVE_F:
-		if (gb->audio.playingCh3) {
-			GBAudioRun(&gb->audio, mTimingCurrentTime(gb->audio.timing), 0x4);
-			if (gb->audio.ch3.readable || gb->audio.style == GB_AUDIO_CGB) {
-				return gb->audio.ch3.wavedata8[gb->audio.ch3.window >> 1];
-			} else {
-				return 0xFF;
-			}
-		} else {
-			return gb->audio.ch3.wavedata8[address - GB_REG_WAVE_0];
-		}
-		break;
+		return GBApuRead(gb, address);
 	case GB_REG_PCM12:
 		if (gb->model < GB_MODEL_CGB) {
 			mLOG(GB_IO, GAME_ERROR, "Reading from CGB register FF%02X in DMG mode", address);
-		} else if (gb->audio.enable) {
-			GBAudioRun(&gb->audio, mTimingCurrentTime(gb->audio.timing), 0x3);
-			return (gb->audio.ch1.sample) | (gb->audio.ch2.sample << 4);
+		} else {
+			return GBApuRead(gb, address);
 		}
 		break;
 	case GB_REG_PCM34:
 		if (gb->model < GB_MODEL_CGB) {
 			mLOG(GB_IO, GAME_ERROR, "Reading from CGB register FF%02X in DMG mode", address);
-		} else if (gb->audio.enable) {
-			GBAudioRun(&gb->audio, mTimingCurrentTime(gb->audio.timing), 0xC);
-			return (gb->audio.ch3.sample) | (gb->audio.ch4.sample << 4);
+		} else {
+			return GBApuRead(gb, address);
 		}
 		break;
 	case GB_REG_SB:
@@ -628,7 +482,6 @@ uint8_t GBIORead(struct GB* gb, unsigned address) {
 	case GB_REG_NR44:
 	case GB_REG_NR50:
 	case GB_REG_NR51:
-	case GB_REG_NR52:
 	case GB_REG_DIV:
 	case GB_REG_TIMA:
 	case GB_REG_TMA:
@@ -704,7 +557,6 @@ int GBIOReadDirect(struct GB* gb, unsigned address) {
 	case GB_REG_NR44:
 	case GB_REG_NR50:
 	case GB_REG_NR51:
-	case GB_REG_NR52:
 	case GB_REG_DIV:
 	case GB_REG_TIMA:
 	case GB_REG_TMA:
