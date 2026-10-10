@@ -119,7 +119,26 @@ static inline void _store(struct SM83Core* cpu, uint16_t address, uint8_t value)
 }
 
 // Accesses outside work and high RAM, mirroring GBLoad8 and GBStore8 where nothing else in the machine is touched
-static int _loadAny(struct SM83Core* cpu, uint16_t address, uint32_t pc) {
+// The self-test runs before the machine is set up, so I/O accesses go to the interpreter then
+static bool _selfTesting;
+
+// I/O handlers run at the clock, pc and state of the interpreter's access; 0x100 marks a value read that way
+static int _ioLoad(struct SM83Core* cpu, uint16_t address, uint32_t pc, uint32_t at) {
+	if (_selfTesting) {
+		return -1;
+	}
+	int32_t cycles = cpu->cycles;
+	cpu->cycles += cpu->tMultiplier * (4 * at + 1);
+	cpu->executionState = SM83_CORE_IDLE_0;
+	cpu->pc = pc;
+	cpu->index = address;
+	int value = cpu->memory.load8(cpu, address) | 0x100;
+	cpu->cycles = cycles;
+	cpu->executionState = SM83_CORE_FETCH;
+	return value;
+}
+
+static int _loadAny(struct SM83Core* cpu, uint16_t address, uint32_t pc, uint32_t at) {
 	int value = _load(cpu, address, pc);
 	if (value >= 0) {
 		return value;
@@ -156,12 +175,13 @@ static int _loadAny(struct SM83Core* cpu, uint16_t address, uint32_t pc) {
 			return 0xFF;
 		}
 		if (address >= GB_BASE_IO && address < GB_BASE_HRAM) {
-			return GBIOReadDirect(gb, address & (GB_SIZE_IO - 1));
+			value = GBIOReadDirect(gb, address & (GB_SIZE_IO - 1));
+			return value >= 0 ? value : _ioLoad(cpu, address, pc, at);
 		}
 		if (address == GB_BASE_IE) {
 			return GBIOReadDirect(gb, GB_REG_IE);
 		}
-		return -1;
+		return _ioLoad(cpu, address, pc, at);
 	default:
 		return -1;
 	}
@@ -174,14 +194,14 @@ static inline bool _storableAny(struct SM83Core* cpu, uint16_t address) {
 	case 0xD:
 	case 0xE:
 		return !memory->mbcWriteHigh;
-	case 0xF:
-		return address < GB_BASE_UNUSABLE || (address >= GB_BASE_HRAM && address < GB_BASE_IE);
 	default:
 		return true;
 	}
 }
 
 // 1 when the store changed what a block may assume, so it has to end after this instruction
+static void _eventsProcessed(struct SM83Core* cpu);
+
 static int _storeAny(struct SM83Core* cpu, uint16_t address, uint8_t value, uint32_t pc, uint32_t at) {
 	if (_storable(cpu, address)) {
 		_store(cpu, address, value);
@@ -196,6 +216,34 @@ static int _storeAny(struct SM83Core* cpu, uint16_t address, uint8_t value, uint
 	// The interpreter's clock and pc at this access, for a mapper that reads them
 	cpu->cycles += cpu->tMultiplier * (4 * at + 1);
 	cpu->pc = pc;
+	if (address >= GB_BASE_UNUSABLE) {
+		if (_selfTesting) {
+			cpu->cycles = cycles;
+			return -1;
+		}
+		cpu->executionState = SM83_CORE_IDLE_0;
+		cpu->memory.store8(cpu, address, value);
+		int t = cpu->tMultiplier;
+		if (cpu->cycles + t * 2 >= cpu->nextEvent) {
+			// An event due within this M-cycle runs at the interpreter's T-cycle steps, and the block's clock follows
+			int i;
+			for (i = 0; i < 3; ++i) {
+				if (cpu->cycles >= cpu->nextEvent) {
+					cpu->irqh.processEvents(cpu);
+				}
+				if (i < 2) {
+					cpu->cycles += t;
+					++cpu->executionState;
+				}
+			}
+			cpu->cycles += t - cpu->tMultiplier * 4 * (at + 1);
+			_eventsProcessed(cpu);
+		} else {
+			cpu->cycles = cycles;
+		}
+		cpu->executionState = SM83_CORE_FETCH;
+		return 1;
+	}
 	switch (address >> 12) {
 	case 0x8:
 	case 0x9:
@@ -338,14 +386,14 @@ DEFINE_LD_ROW_HIGH(7, R7)
 #define DEFINE_LD_R_HL(OPCODE, DST) \
 	OP(LD ## OPCODE) { \
 		USE_ALL; \
-		int value = _loadAny(cpu, cpu->hl, pc); \
+		int value = _loadAny(cpu, cpu->hl, pc, at); \
 		if (value < 0) { \
 			return -1; \
 		} \
 		cpu->index = cpu->hl; \
 		cpu->bus = value; \
 		DST = value; \
-		return 0; \
+		return value >> 8; \
 	}
 
 DEFINE_LD_R_HL(46, R0)
@@ -387,14 +435,14 @@ DEFINE_LD_HL_R(77, R7)
 #define DEFINE_ALU_HL(OPCODE, ALU) \
 	OP(ALU ## OPCODE) { \
 		USE_ALL; \
-		int value = _loadAny(cpu, cpu->hl, pc); \
+		int value = _loadAny(cpu, cpu->hl, pc, at); \
 		if (value < 0) { \
 			return -1; \
 		} \
 		cpu->index = cpu->hl; \
 		cpu->bus = value; \
 		ALU(cpu->bus) \
-		return 0; \
+		return value >> 8; \
 	}
 
 #define DEFINE_ALU_N(OPCODE, ALU) \
@@ -470,7 +518,7 @@ OP(INC_HL) {
 	if (!_storableAny(cpu, cpu->hl)) {
 		return -1;
 	}
-	int value = _loadAny(cpu, cpu->hl, pc);
+	int value = _loadAny(cpu, cpu->hl, pc, at - 1);
 	if (value < 0) {
 		return -1;
 	}
@@ -481,7 +529,7 @@ OP(INC_HL) {
 	cpu->f.h = (cpu->bus & 0xF) == 0xF;
 	cpu->bus = diff;
 	cpu->f.z = !cpu->bus;
-	return _storeAny(cpu, cpu->index, cpu->bus, pc, at);
+	return _storeAny(cpu, cpu->index, cpu->bus, pc, at) | (value >> 8);
 }
 
 OP(DEC_HL) {
@@ -489,7 +537,7 @@ OP(DEC_HL) {
 	if (!_storableAny(cpu, cpu->hl)) {
 		return -1;
 	}
-	int value = _loadAny(cpu, cpu->hl, pc);
+	int value = _loadAny(cpu, cpu->hl, pc, at - 1);
 	if (value < 0) {
 		return -1;
 	}
@@ -500,7 +548,7 @@ OP(DEC_HL) {
 	cpu->f.h = (cpu->bus & 0xF) == 0;
 	cpu->bus = diff;
 	cpu->f.z = !cpu->bus;
-	return _storeAny(cpu, cpu->index, cpu->bus, pc, at);
+	return _storeAny(cpu, cpu->index, cpu->bus, pc, at) | (value >> 8);
 }
 
 OP(LD_HL_N) {
@@ -731,7 +779,7 @@ OP(LDHLSP) {
 	OP(LDA ## NAME) { \
 		USE_ALL; \
 		uint16_t address = ADDRESS; \
-		int value = _loadAny(cpu, address, pc); \
+		int value = _loadAny(cpu, address, pc, at); \
 		if (value < 0) { \
 			return -1; \
 		} \
@@ -739,7 +787,7 @@ OP(LDHLSP) {
 		AFTER; \
 		cpu->bus = value; \
 		cpu->a = value; \
-		return 0; \
+		return value >> 8; \
 	}
 
 #define DEFINE_STA_IND(NAME, ADDRESS, AFTER) \
@@ -915,6 +963,36 @@ DEFINE_JR(, COND_ALWAYS) DEFINE_JR(NZ, COND_NZ) DEFINE_JR(Z, COND_Z) DEFINE_JR(N
 DEFINE_CALL(, COND_ALWAYS) DEFINE_CALL(NZ, COND_NZ) DEFINE_CALL(Z, COND_Z) DEFINE_CALL(NC, COND_NC) DEFINE_CALL(C, COND_C)
 DEFINE_RET(, COND_ALWAYS, 4, 0) DEFINE_RET(NZ, COND_NZ, 5, 2) DEFINE_RET(Z, COND_Z, 5, 2) DEFINE_RET(NC, COND_NC, 5, 2) DEFINE_RET(C, COND_C, 5, 2)
 
+// EI, DI and RETI act through the interrupt handler at the end of their first M-cycle, as the interpreter runs them
+static int _setInterrupts(struct SM83Core* cpu, bool enable, uint32_t at) {
+	int32_t cycles = cpu->cycles;
+	cpu->cycles += cpu->tMultiplier * (4 * at + 3);
+	cpu->irqh.setInterrupts(cpu, enable);
+	cpu->cycles = cycles;
+	return 1;
+}
+
+OP(EI) {
+	USE_ALL;
+	cpu->bus = 0xFB;
+	return _setInterrupts(cpu, true, at);
+}
+
+OP(DI) {
+	USE_ALL;
+	cpu->bus = 0xF3;
+	return _setInterrupts(cpu, false, at);
+}
+
+OP(RETI) {
+	int cycles = _opRET(cpu, operand, pc, at);
+	if (cycles < 0) {
+		return -1;
+	}
+	_setInterrupts(cpu, true, at);
+	return cycles;
+}
+
 OP(JPHL) {
 	USE_ALL;
 	cpu->pc = cpu->hl;
@@ -1039,16 +1117,16 @@ static inline uint8_t _cbOp(struct SM83Core* cpu, unsigned op, uint8_t reg) {
 		if ((op >> 6) != 1 && !_storableAny(cpu, cpu->hl)) { \
 			return -1; \
 		} \
-		int loaded = _loadAny(cpu, cpu->hl, pc); \
+		int loaded = _loadAny(cpu, cpu->hl, pc, (op >> 6) != 1 ? at - 1 : at); \
 		if (loaded < 0) { \
 			return -1; \
 		} \
 		cpu->index = cpu->hl; \
 		cpu->bus = _cbOp(cpu, op, loaded); \
 		if ((op >> 6) != 1) { \
-			return _storeAny(cpu, cpu->index, cpu->bus, pc, at); \
+			return _storeAny(cpu, cpu->index, cpu->bus, pc, at) | (loaded >> 8); \
 		} \
-		return 0; \
+		return loaded >> 8; \
 	}
 
 #define DEFINE_CB_ROW(HI) \
@@ -1118,11 +1196,11 @@ static const struct GBJitOpInfo _ops[0x100] = {
 	/* 0xC0 */ B(RETNZ, 1, 0, 5, L), I(POPBC, 1, 3, L), B(JPNZ, 3, 0, 4, 0), B(JP, 3, 0, 4, 0), B(CALLNZ, 3, 0, 6, S), I(PUSHBC, 1, 4, S), I(ALU_ADDC6, 2, 2, 0), B(RST00, 1, 0, 4, S),
 	/* 0xC8 */ B(RETZ, 1, 0, 5, L), B(RET, 1, 0, 4, L), B(JPZ, 3, 0, 4, 0), X, B(CALLZ, 3, 0, 6, S), B(CALL, 3, 0, 6, S), I(ALU_ADCCE, 2, 2, 0), B(RST08, 1, 0, 4, S),
 	/* 0xD0 */ B(RETNC, 1, 0, 5, L), I(POPDE, 1, 3, L), B(JPNC, 3, 0, 4, 0), X, B(CALLNC, 3, 0, 6, S), I(PUSHDE, 1, 4, S), I(ALU_SUBD6, 2, 2, 0), B(RST10, 1, 0, 4, S),
-	/* 0xD8 */ B(RETC, 1, 0, 5, L), X, B(JPC, 3, 0, 4, 0), X, B(CALLC, 3, 0, 6, S), X, I(ALU_SBCDE, 2, 2, 0), B(RST18, 1, 0, 4, S),
+	/* 0xD8 */ B(RETC, 1, 0, 5, L), B(RETI, 1, 0, 4, L), B(JPC, 3, 0, 4, 0), X, B(CALLC, 3, 0, 6, S), X, I(ALU_SBCDE, 2, 2, 0), B(RST18, 1, 0, 4, S),
 	/* 0xE0 */ I(STAIO, 2, 3, S), I(POPHL, 1, 3, L), I(STAIOC, 1, 2, S), X, X, I(PUSHHL, 1, 4, S), I(ALU_ANDE6, 2, 2, 0), B(RST20, 1, 0, 4, S),
 	/* 0xE8 */ I(ADDSP, 2, 4, 0), B(JPHL, 1, 0, 1, 0), I(STANN, 3, 4, S), X, X, X, I(ALU_XOREE, 2, 2, 0), B(RST28, 1, 0, 4, S),
-	/* 0xF0 */ I(LDAIO, 2, 3, L), I(POPAF, 1, 3, L), I(LDAIOC, 1, 2, L), X, X, I(PUSHAF, 1, 4, S), I(ALU_ORF6, 2, 2, 0), B(RST30, 1, 0, 4, S),
-	/* 0xF8 */ I(LDHLSP, 2, 3, 0), I(LDSPHL, 1, 2, 0), I(LDANN, 3, 4, L), X, X, X, I(ALU_CPFE, 2, 2, 0), B(RST38, 1, 0, 4, S),
+	/* 0xF0 */ I(LDAIO, 2, 3, L), I(POPAF, 1, 3, L), I(LDAIOC, 1, 2, L), I(DI, 1, 1, S), X, I(PUSHAF, 1, 4, S), I(ALU_ORF6, 2, 2, 0), B(RST30, 1, 0, 4, S),
+	/* 0xF8 */ I(LDHLSP, 2, 3, 0), I(LDSPHL, 1, 2, 0), I(LDANN, 3, 4, L), I(EI, 1, 1, S), X, X, I(ALU_CPFE, 2, 2, 0), B(RST38, 1, 0, 4, S),
 };
 
 #undef I
@@ -1150,6 +1228,7 @@ struct GBJitEntry {
 
 struct GBJit {
 	struct GB* gb;
+	bool eventsProcessed;
 	struct GBJitEntry* bailed;
 	bool noInline;
 	uint8_t* code;
@@ -1163,6 +1242,10 @@ struct GBJit {
 struct Emitter {
 	uint8_t* p;
 };
+
+static void _eventsProcessed(struct SM83Core* cpu) {
+	((struct GB*) cpu->master)->jit->eventsProcessed = true;
+}
 
 static void _byte(struct Emitter* e, uint8_t b) {
 	*e->p = b;
@@ -1743,10 +1826,10 @@ static void* _compile(struct GBJit* jit, const uint8_t* rom, size_t offset, uint
 		_word32(&e, insn->operand);
 		_byte(&e, 0xBA);
 		_word32(&e, (uint16_t) (insn->pc + insn->length));
-		if (insn->info->kind & KIND_STORE) {
-			// mov ecx, M-cycle of the store
+		if (insn->info->kind & (KIND_LOAD | KIND_STORE)) {
+			// mov ecx, M-cycle of the access (a branch's first)
 			_byte(&e, 0xB9);
-			_word32(&e, total + insn->info->cycles - 1);
+			_word32(&e, (insn->info->kind & KIND_BRANCH) ? total : total + insn->info->cycles - 1);
 		}
 		_call(&e, insn->info->op);
 		if (insn->info->kind & (KIND_LOAD | KIND_STORE)) {
@@ -1756,8 +1839,8 @@ static void* _compile(struct GBJit* jit, const uint8_t* rom, size_t offset, uint
 			bails[i] = _jcc32(&e, 0x88);
 			anyBail = true;
 		}
-		if ((insn->info->kind & KIND_STORE) && !(insn->info->kind & KIND_BRANCH) && i + 1 < n) {
-			// jnz: the store changed the machine, so stop before the next instruction
+		if ((insn->info->kind & (KIND_LOAD | KIND_STORE)) && !(insn->info->kind & KIND_BRANCH) && i + 1 < n) {
+			// jnz: the access changed the machine, so stop before the next instruction
 			ends[i] = _jcc32(&e, 0x85);
 		}
 		total += insn->info->cycles;
@@ -1799,7 +1882,7 @@ static void* _compile(struct GBJit* jit, const uint8_t* rom, size_t offset, uint
 			} else if ((op & 0xC7) == 0xC7) {
 				_chain(&e, jit, regionOffset, pc, end, op & 0x38, true, noLink, &nNoLink);
 			}
-			if (op != 0xC3 && op != 0x18 && op != 0xCD && op != 0xC9 && op != 0xE9 && (op & 0xC7) != 0xC7) {
+			if (op != 0xC3 && op != 0x18 && op != 0xCD && op != 0xC9 && op != 0xD9 && op != 0xE9 && (op & 0xC7) != 0xC7) {
 				_chain(&e, jit, regionOffset, pc, end, next, true, noLink, &nNoLink);
 			}
 			for (i = 0; i < nNoLink; ++i) {
@@ -2010,7 +2093,9 @@ struct GBJit* GBJitCreate(struct GB* gb) {
 	}
 	jit->used = FLAG_TABLE_BYTES;
 	if (getenv("MGBA_JIT_SELFTEST")) {
+		_selfTesting = true;
 		_selfTest(jit, atoi(getenv("MGBA_JIT_SELFTEST")));
+		_selfTesting = false;
 	}
 	return jit;
 }
@@ -2089,11 +2174,15 @@ static bool _runBlock(struct SM83Core* cpu, struct GBJit* jit) {
 	return cpu->cycles != cycles;
 }
 
-bool GBJitRun(struct SM83Core* cpu) {
+int GBJitRun(struct SM83Core* cpu) {
 	struct GBJit* jit = ((struct GB*) cpu->master)->jit;
-	bool ran = false;
+	int ran = 0;
+	jit->eventsProcessed = false;
 	while (_runBlock(cpu, jit)) {
-		ran = true;
+		ran = 1;
+		if (jit->eventsProcessed) {
+			return 2;
+		}
 	}
 	return ran;
 }
@@ -2113,7 +2202,7 @@ void GBJitFlush(struct GBJit* jit) {
 	UNUSED(jit);
 }
 
-bool GBJitRun(struct SM83Core* cpu) {
+int GBJitRun(struct SM83Core* cpu) {
 	UNUSED(cpu);
 	return false;
 }

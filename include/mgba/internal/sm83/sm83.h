@@ -146,7 +146,8 @@ struct SM83Core {
 	SM83Instruction instruction;
 
 	bool irqPending;
-	bool (*runJit)(struct SM83Core*);
+	// Nonzero when it ran code; 2 when it also processed events, which ends the run as a tick that did so
+	int (*runJit)(struct SM83Core*);
 
 	struct SM83Memory memory;
 	struct SM83InterruptHandler irqh;

@@ -18,7 +18,7 @@ struct SM83Core;
 struct GBJit* GBJitCreate(struct GB* gb);
 void GBJitDestroy(struct GBJit* jit);
 void GBJitFlush(struct GBJit* jit);
-bool GBJitRun(struct SM83Core* cpu);
+int GBJitRun(struct SM83Core* cpu);
 
 CXX_GUARD_END
 
