@@ -164,8 +164,18 @@ struct Compiler {
 		bool smcEwram;
 		uint8_t* done;
 		uint8_t* toEvent;
+		// Set when the access went through a shared routine, which comes back to site for the handlers or after a store into code
+		uint8_t* site;
 	} cold[2 * MAX_SPAN];
 	unsigned nCold;
+	// Handler fallbacks placed after the block, entered from sites in it
+	struct {
+		unsigned index;
+		bool dynamic;
+		uint8_t* sites[6];
+		unsigned nSites;
+	} deferred[MAX_SPAN];
+	unsigned nDeferred;
 };
 
 static void _exitAt(struct Compiler* c, uint8_t* at, int index) {
@@ -399,46 +409,10 @@ static void _trackMulti(struct Compiler* c, const struct MultiOp* m) {
 	}
 }
 
-static int32_t _ramWait(struct Compiler* c, const struct MemOp* mem, bool ewram) {
-	if (!ewram) {
-		return 0;
-	}
-	return (mem->size == 4 ? c->gba->memory.waitstatesNonseq32 : c->gba->memory.waitstatesNonseq16)[GBA_REGION_EWRAM];
-}
-
-enum {
-	PATH_NONE,
-	PATH_IWRAM,
-	PATH_EWRAM,
-	PATH_VRAM,
-	PATH_CART,
-};
-
 // Where the code's own N and S fetch waits live, which a store to WAITCNT changes for the rest of its instruction
 static void _fetchWaits(const struct Compiler* c, unsigned* nonseq, unsigned* seq) {
 	*nonseq = OFF_MEMORY + (c->thumb ? offsetof(struct ARMMemory, activeNonseqCycles16) : offsetof(struct ARMMemory, activeNonseqCycles32));
 	*seq = OFF_MEMORY + (c->thumb ? offsetof(struct ARMMemory, activeSeqCycles16) : offsetof(struct ARMMemory, activeSeqCycles32));
-}
-
-// An access checks inline only the region its base register pointed into when compiled
-static int _memPath(struct Compiler* c, const struct MemOp* mem) {
-	switch (_sourceRegion(c, mem->base)) {
-	case -1:
-	case GBA_REGION_IWRAM:
-		return PATH_IWRAM;
-	case GBA_REGION_EWRAM:
-		return PATH_EWRAM;
-	case GBA_REGION_VRAM:
-		return !c->romCode && (mem->load || mem->size > 1) ? PATH_VRAM : PATH_NONE;
-	case GBA_REGION_ROM0:
-	case GBA_REGION_ROM0_EX:
-	case GBA_REGION_ROM1:
-	case GBA_REGION_ROM1_EX:
-	case GBA_REGION_ROM2:
-		return mem->load ? PATH_CART : PATH_NONE;
-	default:
-		return PATH_NONE;
-	}
 }
 
 #if defined(__aarch64__)
@@ -496,7 +470,7 @@ static void _emitPatched(struct Compiler* c, unsigned i) {
 		done[nDone++] = _forwardJump(c);
 		_patch(other, c->e.p);
 	}
-	_emitDynamicHandler(c, i);
+	_emitPatchedFallback(c, i);
 	for (k = 0; k < nDone; ++k) {
 		_patch(done[k], c->e.p);
 	}
@@ -794,6 +768,7 @@ static void _startBlock(struct Compiler* c, struct ARMJitBlock* block) {
 	c->nRuns = 0;
 	c->nLoops = 0;
 	c->nCold = 0;
+	c->nDeferred = 0;
 	c->seq16 = cpu->memory.activeSeqCycles16;
 	c->nonseq16 = cpu->memory.activeNonseqCycles16;
 	c->prefetch = c->gba->memory.prefetch;
@@ -942,12 +917,7 @@ static void _emitExits(struct Compiler* c) {
 		unsigned at = index & ~EXIT_DUE;
 		if (index >= 0 && !stubs[due][at]) {
 			stubs[due][at] = c->e.p;
-			_storeState(c, at);
-			if (due) {
-				_resumeAfterEvents(c, _entryCode(c, at));
-			} else {
-				_exitJump(c, EXIT_DIRECT);
-			}
+			_emitExitStub(c, at, due);
 		}
 	}
 	uint8_t* direct = c->e.p;
@@ -1049,6 +1019,7 @@ static struct ARMJitBlock* _compile(struct ARMJit* jit, struct ARMCore* cpu, uin
 	uint8_t* code = c->e.p;
 	_emitBody(c);
 	_emitColdPaths(c);
+	_emitDeferred(c);
 	_emitCarefulCopies(c);
 	_emitExits(c);
 	_emitEntries(c);
@@ -1093,7 +1064,7 @@ static unsigned _selfTestAluMode(struct ARMJit* jit, unsigned iterations, bool t
 		}
 		a.gprs[ARM_PC] = address + (thumb ? 4 : 8);
 		seed = seed * 1103515245 + 12345;
-		a.cpsr.packed = (seed & 0xFF000000) | (thumb ? 0x3F : 0x1F);
+		a.cpsr.packed = (seed & 0xF0000000) | (thumb ? 0x3F : 0x1F);
 		struct ARMCore b = a;
 
 		if (thumb) {
@@ -1205,6 +1176,10 @@ enum ARMJitResult ARMJitRun(struct ARMCore* cpu) {
 		entry = &block->entries[0];
 	}
 	if (((cpu->prefetch[0] ^ entry->op0) & entry->opMask0) || ((cpu->prefetch[1] ^ entry->op1) & entry->opMask1)) {
+		return ARM_JIT_STEP;
+	}
+	// Generated code keeps the flags apart from the rest of CPSR, which it needs clear in bits 24 to 27
+	if (cpu->cpsr.packed & 0x0F000000) {
 		return ARM_JIT_STEP;
 	}
 	jit->pendingLink = NULL;

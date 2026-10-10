@@ -47,11 +47,30 @@ struct ARMJit {
 	uint8_t* dispatch;
 	uint8_t* linkDispatch;
 	uint8_t* toC;
+	// Back to C without writing the flags register into CPSR, which C has already changed
+	uint8_t* toCDirect;
 	// Set by a link stub so the dispatcher patches that exit to jump straight to the block
 	struct ARMJitLink* pendingLink;
 	// Due events run from generated code; it keeps running while the frame loop would
 	uint8_t* events;
 	uint8_t* resume;
+	// Calls into C: a routine per function, and one for the function in x16 (AArch64)
+	uint8_t* callC;
+	uint8_t* callHandler;
+	uint8_t* callEvents;
+	uint8_t* callInvalidate;
+	uint8_t* callReadTimer;
+	uint8_t* callVramWait;
+	// Memory accesses by load, size and sign extension, from code outside the cartridge and from cartridge code (AArch64)
+	uint8_t* memRoutines[8];
+	uint8_t* memRomRoutines[8];
+	uint8_t* callRomStall;
+	// The bookkeeping of a branch within a region, for ARM and for Thumb (AArch64)
+	uint8_t* branchRoutines[2];
+	// LDM and STM on IWRAM or EWRAM, by load and by cartridge code (AArch64)
+	uint8_t* multiRoutines[2][2];
+	// An exit for due events with the PC in w0 and the pipeline read from the code, for ARM and for Thumb (AArch64)
+	uint8_t* exitRoutines[2];
 	bool eventsRan;
 	bool inFrame;
 	uint32_t frameCounter;
