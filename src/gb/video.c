@@ -33,10 +33,8 @@ static void GBVideoDummyRendererPutPixels(struct GBVideoRenderer* renderer, size
 
 static void _cleanOAM(struct GBVideo* video, int y);
 
-static void _endMode0(struct mTiming* timing, void* context, uint32_t cyclesLate);
-static void _endMode1(struct mTiming* timing, void* context, uint32_t cyclesLate);
-static void _endMode2(struct mTiming* timing, void* context, uint32_t cyclesLate);
-static void _endMode3(struct mTiming* timing, void* context, uint32_t cyclesLate);
+static void _ppuStep(struct mTiming* timing, void* context, uint32_t cyclesLate);
+static void _ppuIRQ(struct mTiming* timing, void* context, uint32_t cyclesLate);
 static void _updateFrameCount(struct mTiming* timing, void* context, uint32_t cyclesLate);
 
 static const uint16_t _defaultBorderPalette[16] = {
@@ -286,12 +284,16 @@ void GBVideoInit(struct GBVideo* video) {
 
 	video->modeEvent.context = video;
 	video->modeEvent.name = "GB Video Mode";
-	video->modeEvent.callback = NULL;
+	video->modeEvent.callback = _ppuStep;
 	video->modeEvent.priority = 8;
 	video->frameEvent.context = video;
 	video->frameEvent.name = "GB Video Frame";
 	video->frameEvent.callback = _updateFrameCount;
 	video->frameEvent.priority = 9;
+	video->irqEvent.context = video;
+	video->irqEvent.name = "GB Video IRQ";
+	video->irqEvent.callback = _ppuIRQ;
+	video->irqEvent.priority = 7;
 
 	video->dmgPalette[0] = 0x7FFF;
 	video->dmgPalette[1] = 0x56B5;
@@ -313,8 +315,20 @@ void GBVideoReset(struct GBVideo* video) {
 	video->ly = 0;
 	video->x = 0;
 	video->mode = 0;
-	video->lcdOnLine = false;
 	video->stat = 0;
+	video->ppuState = 0;
+	video->lineCycles = 0;
+	video->modeForInterrupt = -1;
+	video->lyForComparison = 0;
+	video->statLine = false;
+	video->lycLine = false;
+	video->wyTriggered = false;
+	video->oamReadBlocked = false;
+	video->oamWriteBlocked = false;
+	video->vramReadBlocked = false;
+	video->vramWriteBlocked = false;
+	video->paletteBlocked = false;
+	video->lineObjCount = 0;
 
 	video->frameCounter = 0;
 	video->frameskipCounter = 0;
@@ -490,186 +504,565 @@ void GBVideoAssociateRenderer(struct GBVideo* video, struct GBVideoRenderer* ren
 	video->renderer->init(video->renderer, video->p->model, video->sgbBorders);
 }
 
-static bool _statIRQAsserted(GBRegisterSTAT stat) {
-	// TODO: variable for the IRQ line value?
-	if (GBRegisterSTATIsLYCIRQ(stat) && GBRegisterSTATIsLYC(stat)) {
-		return true;
+// The PPU follows SameBoy's model of the hardware, a T-cycle at a time where it matters: each state is
+// a point in a line where something visible changes, and the line's cycles count from its start
+enum {
+	PPU_OFF = 0,
+	PPU_LCDON_OAM,
+	PPU_LCDON_MODE3,
+	PPU_LCDON_PALETTE,
+	PPU_LCDON_VRAM,
+	PPU_LINE_START,
+	PPU_LINE_OAM,
+	PPU_LINE_LY,
+	PPU_LINE_MODE2,
+	PPU_LINE_VRAM,
+	PPU_LINE_MODE3,
+	PPU_LINE_PALETTE,
+	PPU_MODE3_START,
+	PPU_MODE3_END,
+	PPU_HBLANK_STAT,
+	PPU_HBLANK_PALETTE,
+	PPU_HBLANK_UNBLOCK,
+	PPU_LINE_WY,
+	PPU_LINE_NEXT,
+	PPU_VBLANK_START,
+	PPU_VBLANK_LY,
+	PPU_VBLANK_LYC,
+	PPU_VBLANK_MODE1,
+	PPU_VBLANK_NEXT,
+	PPU_LINE153_START,
+	PPU_LINE153_LY,
+	PPU_LINE153_LY0,
+	PPU_LINE153_LYC,
+	PPU_LINE153_LYC0,
+	PPU_LINE153_HOLD,
+	PPU_LINE153_NEXT,
+};
+
+static bool _isCGB(const struct GBVideo* video) {
+	return video->p->model >= GB_MODEL_CGB;
+}
+
+static void _setMode(struct GBVideo* video, int mode) {
+	video->mode = mode;
+	video->stat = GBRegisterSTATSetMode(video->stat, mode);
+	video->p->memory.io[GB_REG_STAT] = video->stat;
+}
+
+static void _blockAll(struct GBVideo* video, bool block) {
+	video->oamReadBlocked = block;
+	video->oamWriteBlocked = block;
+	video->vramReadBlocked = block;
+	video->vramWriteBlocked = block;
+	video->paletteBlocked = block;
+}
+
+// The CPU decides on interrupts as its last access before an instruction happens, a little before the
+// interpreter looks at them, so PPU interrupts reach it that much later
+static void _raiseIRQs(struct GBVideo* video) {
+	if (!mTimingIsScheduled(&video->p->timing, &video->irqEvent)) {
+		// Measured against the interrupt timing tests: 1.5 T-cycles running, 2 T-cycles in HALT
+		int t = video->p->cpu->tMultiplier;
+		mTimingSchedule(&video->p->timing, &video->irqEvent, video->p->cpu->halted ? 2 * t : 3 * t / 2);
 	}
-	switch (GBRegisterSTATGetMode(stat)) {
-	case 0:
-		if (GBRegisterSTATIsHblankIRQ(stat)) {
-			return true;
+}
+
+static void _ppuIRQ(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+	UNUSED(timing);
+	UNUSED(cyclesLate);
+	struct GBVideo* video = context;
+	GBUpdateIRQs(video->p);
+}
+
+// The STAT interrupt is the OR of its enabled sources, and fires on a rising edge
+static void _statUpdate(struct GBVideo* video) {
+	struct GB* gb = video->p;
+	if (!GBRegisterLCDCIsEnable(gb->memory.io[GB_REG_LCDC])) {
+		return;
+	}
+	if (gb->memory.dmaRemaining && !gb->memory.dmaStarting && GBRegisterSTATGetMode(video->stat) == 2) {
+		video->stat = GBRegisterSTATSetMode(video->stat, 0);
+	}
+	bool previous = video->statLine;
+	if (video->lyForComparison != -1 || !_isCGB(video)) {
+		if (video->lyForComparison == gb->memory.io[GB_REG_LYC]) {
+			video->lycLine = true;
+			video->stat = GBRegisterSTATFillLYC(video->stat);
+		} else {
+			if (video->lyForComparison != -1) {
+				video->lycLine = false;
+			}
+			video->stat = GBRegisterSTATClearLYC(video->stat);
 		}
+	}
+	bool line;
+	switch (video->modeForInterrupt) {
+	case 0:
+		line = GBRegisterSTATIsHblankIRQ(video->stat);
 		break;
 	case 1:
-		if (GBRegisterSTATIsVblankIRQ(stat)) {
-			return true;
-		}
+		line = GBRegisterSTATIsVblankIRQ(video->stat);
 		break;
 	case 2:
-		if (GBRegisterSTATIsOAMIRQ(stat)) {
-			return true;
-		}
+		line = GBRegisterSTATIsOAMIRQ(video->stat);
 		break;
-	case 3:
+	default:
+		line = false;
 		break;
 	}
-	return false;
+	if (GBRegisterSTATIsLYCIRQ(video->stat) && video->lycLine) {
+		line = true;
+	}
+	video->statLine = line;
+	gb->memory.io[GB_REG_STAT] = video->stat;
+	if (line && !previous) {
+		gb->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
+		_raiseIRQs(video);
+	}
+}
+
+// Objects the OAM scan picks for a line, largest X first, as the fetcher meets them from the end
+static void _scanObjects(struct GBVideo* video) {
+	int height = GBRegisterLCDCIsObjSize(video->p->memory.io[GB_REG_LCDC]) ? 16 : 8;
+	int n = 0;
+	int i;
+	for (i = 0; i < GB_VIDEO_MAX_OBJ && n < GB_VIDEO_MAX_LINE_OBJ; ++i) {
+		int y = video->oam.obj[i].y - 16;
+		if (y > video->ly || y + height <= video->ly) {
+			continue;
+		}
+		uint8_t x = video->oam.obj[i].x;
+		int j;
+		for (j = 0; j < n; ++j) {
+			if (video->lineObjX[j] <= x) {
+				break;
+			}
+		}
+		memmove(&video->lineObjX[j + 1], &video->lineObjX[j], n - j);
+		video->lineObjX[j] = x;
+		++n;
+	}
+	video->lineObjCount = n;
+}
+
+enum {
+	FETCH_SLEEP,
+	FETCH_TILE,
+	FETCH_LOW,
+	FETCH_HIGH,
+	FETCH_PUSH,
+};
+
+// The background fetcher's steps, which only matter here for when it has a row of 8 pixels ready
+static void _advanceFetcher(int* state, int* fifo, bool cgb, bool windowQuirk, uint8_t wx, uint8_t position) {
+	static const uint8_t steps[8] = { FETCH_SLEEP, FETCH_TILE, FETCH_SLEEP, FETCH_LOW, FETCH_SLEEP, FETCH_HIGH, FETCH_PUSH, FETCH_PUSH };
+	switch (steps[*state & 7]) {
+	case FETCH_PUSH:
+	case FETCH_HIGH:
+		if (*state < 7) {
+			++*state;
+		}
+		if (*fifo > 0) {
+			break;
+		}
+		if (windowQuirk && !cgb) {
+			uint8_t logical = position + 7;
+			if (logical > 167) {
+				logical = 0;
+			}
+			if (wx == logical) {
+				*fifo = 1;
+				break;
+			}
+		}
+		*fifo = 8;
+		*state = 0;
+		break;
+	default:
+		++*state;
+		break;
+	}
+}
+
+// Mode 3 runs until 160 pixels are out: 8 dropped at the start, SCX & 7 dropped for scrolling, and
+// stalls for each object fetch and for the window
+static int _mode3Length(struct GBVideo* video) {
+	struct GB* gb = video->p;
+	bool cgb = _isCGB(video);
+	uint8_t lcdc = gb->memory.io[GB_REG_LCDC];
+	uint8_t scx = gb->memory.io[GB_REG_SCX];
+	uint8_t wx = gb->memory.io[GB_REG_WX];
+	bool window = video->wyTriggered && (lcdc & 0x20);
+	int n = video->lineObjCount;
+	if (!n && !window) {
+		return 167 + (scx & 7);
+	}
+	static const int8_t wx0Position[8] = { -7, -1, -2, -3, -4, -5, -6, -6 };
+	bool objects = (lcdc & 2) || cgb;
+	bool windowQuirk = video->wyTriggered && !(lcdc & 0x20);
+	uint8_t position = -16;
+	int fetcher = 0;
+	int fifo = 8;
+	bool wxTriggered = false;
+	bool windowFetching = false;
+	int cycles = 0;
+	while (true) {
+		if (!wxTriggered && window) {
+			bool activate = false;
+			if (wx == 0) {
+				activate = position == (uint8_t) wx0Position[scx & 7];
+			} else if (wx < 166 + cgb) {
+				activate = wx == (uint8_t) (position + 7) || wx == (uint8_t) (position + 6);
+			}
+			if (activate) {
+				if (wx == 0 && (scx & 7)) {
+					++cycles;
+				}
+				wxTriggered = true;
+				fifo = 0;
+				fetcher = 0;
+				windowFetching = true;
+			}
+		}
+		if (!cgb && wxTriggered && !windowFetching && fetcher == 0 && wx == (uint8_t) (position + 7) && fifo == 8) {
+			++fifo;
+		}
+
+		uint8_t match = position + 8;
+		if (match > (uint8_t) -16) {
+			match = 0;
+		}
+		while (n && video->lineObjX[n - 1] < match) {
+			--n;
+		}
+		while (n && objects && video->lineObjX[n - 1] == match) {
+			while (fetcher < 5 || !fifo) {
+				_advanceFetcher(&fetcher, &fifo, cgb, windowQuirk, wx, position);
+				++cycles;
+			}
+			_advanceFetcher(&fetcher, &fifo, cgb, windowQuirk, wx, position);
+			_advanceFetcher(&fetcher, &fifo, cgb, windowQuirk, wx, position);
+			cycles += 6;
+			--n;
+		}
+
+		if (!(n && objects && video->lineObjX[n - 1] == 0) && !(wxTriggered && !fifo)) {
+			--fifo;
+			bool drawn = true;
+			if ((uint8_t) (position + 16) < 8) {
+				if ((position & 7) == (scx & 7)) {
+					position = -8;
+				} else if (position == (uint8_t) -9) {
+					position = -16;
+					drawn = false;
+				}
+			}
+			if (drawn) {
+				if (position < 160) {
+					windowFetching = false;
+				}
+				++position;
+			}
+		}
+		_advanceFetcher(&fetcher, &fifo, cgb, windowQuirk, wx, position);
+		if (position == 160) {
+			break;
+		}
+		++cycles;
+	}
+	return cycles;
+}
+
+static void _ppuSchedule(struct GBVideo* video, int state, int dots, int32_t cyclesLate) {
+	video->ppuState = state;
+	mTimingSchedule(&video->p->timing, &video->modeEvent, (dots << 1) - cyclesLate);
+}
+
+static void _startMode3(struct GBVideo* video, int32_t cyclesLate) {
+	struct GB* gb = video->p;
+	video->x = -(gb->memory.io[GB_REG_SCX] & 7);
+	video->dotClock = mTimingCurrentTime(&gb->timing) - cyclesLate + 10 - (video->x << 1);
+	_setMode(video, 3);
+	video->modeForInterrupt = 3;
+}
+
+static void _startLine(struct GBVideo* video, int32_t cyclesLate) {
+	video->oamWriteBlocked = _isCGB(video) && !video->p->doubleSpeed;
+	video->lineCycles = 0;
+	_ppuSchedule(video, PPU_LINE_OAM, 2, cyclesLate);
+}
+
+static void _startVBlankLine(struct GBVideo* video, int32_t cyclesLate) {
+	video->lyForComparison = -1;
+	_statUpdate(video);
+	_ppuSchedule(video, PPU_VBLANK_LY, 2, cyclesLate);
+}
+
+static void _ppuStep(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+	UNUSED(timing);
+	struct GBVideo* video = context;
+	struct GB* gb = video->p;
+	bool cgb = _isCGB(video);
+	switch (video->ppuState) {
+	case PPU_OFF:
+		return;
+
+	// The first line after the LCD turns on: no OAM scan, and HBlank shorter by 8
+	case PPU_LCDON_OAM:
+		video->oamWriteBlocked = true;
+		video->lineCycles += 2;
+		_statUpdate(video);
+		_ppuSchedule(video, PPU_LCDON_MODE3, 2, cyclesLate);
+		return;
+	case PPU_LCDON_MODE3:
+		video->lineCycles += 8;
+		video->lineObjCount = 0;
+		_startMode3(video, cyclesLate);
+		video->oamReadBlocked = true;
+		video->oamWriteBlocked = true;
+		video->vramReadBlocked = cgb ? gb->doubleSpeed : true;
+		video->vramWriteBlocked = video->vramReadBlocked;
+		video->lineCycles += 2;
+		_ppuSchedule(video, PPU_LCDON_PALETTE, 2, cyclesLate);
+		return;
+	case PPU_LCDON_PALETTE:
+		video->paletteBlocked = true;
+		video->lineCycles += 3;
+		_ppuSchedule(video, PPU_LCDON_VRAM, 3, cyclesLate);
+		return;
+	case PPU_LCDON_VRAM:
+		video->vramReadBlocked = true;
+		video->vramWriteBlocked = true;
+		// Fall through
+	case PPU_MODE3_START: {
+		if ((gb->memory.io[GB_REG_LCDC] & 0x20) && gb->memory.io[GB_REG_WY] == video->ly) {
+			video->wyTriggered = true;
+		}
+		int length = _mode3Length(video);
+		video->lineCycles += length;
+		_ppuSchedule(video, PPU_MODE3_END, length, cyclesLate);
+		return;
+	}
+
+	// Lines 0 to 143
+	case PPU_LINE_OAM:
+		video->oamWriteBlocked = cgb;
+		_ppuSchedule(video, PPU_LINE_LY, 1, cyclesLate);
+		return;
+	case PPU_LINE_LY:
+		gb->memory.io[GB_REG_LY] = video->ly;
+		video->oamReadBlocked = true;
+		video->lyForComparison = video->ly ? -1 : 0;
+		if (video->ly) {
+			// The OAM interrupt comes a T-cycle before STAT shows mode 2
+			video->modeForInterrupt = 2;
+			_setMode(video, 0);
+		} else if (!cgb) {
+			_setMode(video, 0);
+		}
+		_statUpdate(video);
+		_ppuSchedule(video, PPU_LINE_MODE2, 1, cyclesLate);
+		return;
+	case PPU_LINE_MODE2:
+		_setMode(video, 2);
+		video->modeForInterrupt = 2;
+		video->oamWriteBlocked = true;
+		video->lyForComparison = video->ly;
+		_statUpdate(video);
+		video->modeForInterrupt = -1;
+		_statUpdate(video);
+		_ppuSchedule(video, PPU_LINE_VRAM, 76, cyclesLate);
+		return;
+	case PPU_LINE_VRAM:
+		video->vramReadBlocked = !cgb;
+		video->vramWriteBlocked = false;
+		video->paletteBlocked = false;
+		video->oamWriteBlocked = cgb;
+		_ppuSchedule(video, PPU_LINE_MODE3, 4, cyclesLate);
+		return;
+	case PPU_LINE_MODE3:
+		video->lineCycles = GB_VIDEO_MODE_2_LENGTH + 4;
+		_scanObjects(video);
+		_cleanOAM(video, video->ly);
+		_startMode3(video, cyclesLate);
+		video->vramReadBlocked = true;
+		video->vramWriteBlocked = true;
+		video->paletteBlocked = false;
+		video->oamWriteBlocked = true;
+		video->oamReadBlocked = true;
+		_statUpdate(video);
+		video->lineCycles += 3;
+		_ppuSchedule(video, PPU_LINE_PALETTE, 3, cyclesLate);
+		return;
+	case PPU_LINE_PALETTE:
+		video->paletteBlocked = true;
+		video->lineCycles += 2;
+		_ppuSchedule(video, PPU_MODE3_START, 2, cyclesLate);
+		return;
+	case PPU_MODE3_END:
+		GBVideoProcessDots(video, cyclesLate);
+		if (!gb->doubleSpeed) {
+			_setMode(video, 0);
+			video->modeForInterrupt = 0;
+			_blockAll(video, false);
+		}
+		video->lineCycles += 1;
+		_ppuSchedule(video, PPU_HBLANK_STAT, 1, cyclesLate);
+		return;
+	case PPU_HBLANK_STAT:
+		_setMode(video, 0);
+		video->modeForInterrupt = 0;
+		_blockAll(video, false);
+		_statUpdate(video);
+		video->lineCycles += 2;
+		_ppuSchedule(video, PPU_HBLANK_PALETTE, 2, cyclesLate);
+		return;
+	case PPU_HBLANK_PALETTE:
+		video->paletteBlocked = !gb->doubleSpeed;
+		if (gb->memory.isHdma && gb->memory.io[GB_REG_HDMA5] != 0xFF && !gb->cpu->halted) {
+			gb->memory.hdmaRemaining = 0x10;
+			gb->cpuBlocked = true;
+			mTimingDeschedule(&gb->timing, &gb->memory.hdmaEvent);
+			mTimingSchedule(&gb->timing, &gb->memory.hdmaEvent, 0);
+		}
+		video->lineCycles += 2;
+		_ppuSchedule(video, PPU_HBLANK_UNBLOCK, 2, cyclesLate);
+		return;
+	case PPU_HBLANK_UNBLOCK: {
+		video->paletteBlocked = false;
+		int remaining = GB_VIDEO_HORIZONTAL_LENGTH - 2 - video->lineCycles;
+		if (remaining < 0) {
+			remaining = 0;
+		}
+		_ppuSchedule(video, PPU_LINE_WY, remaining, cyclesLate);
+		return;
+	}
+	case PPU_LINE_WY:
+		if ((gb->memory.io[GB_REG_LCDC] & 0x20) && gb->memory.io[GB_REG_WY] == video->ly) {
+			video->wyTriggered = true;
+		}
+		_ppuSchedule(video, PPU_LINE_NEXT, 2, cyclesLate);
+		return;
+	case PPU_LINE_NEXT:
+		if (video->ly != GB_VIDEO_VERTICAL_PIXELS - 1) {
+			video->modeForInterrupt = 2;
+		}
+		if (video->frameskipCounter <= 0) {
+			video->renderer->finishScanline(video->renderer, video->ly);
+		}
+		++video->ly;
+		if (video->ly < GB_VIDEO_VERTICAL_PIXELS) {
+			_startLine(video, cyclesLate);
+		} else {
+			_startVBlankLine(video, cyclesLate);
+		}
+		return;
+
+	// Lines 144 to 152
+	case PPU_VBLANK_LY:
+		gb->memory.io[GB_REG_LY] = video->ly;
+		if (video->ly == GB_VIDEO_VERTICAL_PIXELS && !video->statLine && GBRegisterSTATIsOAMIRQ(video->stat)) {
+			gb->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
+			_raiseIRQs(video);
+		}
+		_ppuSchedule(video, PPU_VBLANK_LYC, 2, cyclesLate);
+		return;
+	case PPU_VBLANK_LYC:
+		video->lyForComparison = video->ly;
+		_statUpdate(video);
+		_ppuSchedule(video, PPU_VBLANK_MODE1, 1, cyclesLate);
+		return;
+	case PPU_VBLANK_MODE1:
+		if (video->ly == GB_VIDEO_VERTICAL_PIXELS) {
+			// Entering VBlank also sets off the OAM interrupt
+			_setMode(video, 1);
+			gb->memory.io[GB_REG_IF] |= (1 << GB_IRQ_VBLANK);
+			if (!video->statLine && GBRegisterSTATIsOAMIRQ(video->stat)) {
+				gb->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
+			}
+			video->modeForInterrupt = 1;
+			_statUpdate(video);
+			_raiseIRQs(video);
+			mTimingDeschedule(&gb->timing, &video->frameEvent);
+			mTimingSchedule(&gb->timing, &video->frameEvent, -cyclesLate);
+		}
+		_ppuSchedule(video, PPU_VBLANK_NEXT, GB_VIDEO_HORIZONTAL_LENGTH - 5, cyclesLate);
+		return;
+	case PPU_VBLANK_NEXT:
+		++video->ly;
+		if (video->ly < GB_VIDEO_VERTICAL_TOTAL_PIXELS - 1) {
+			_startVBlankLine(video, cyclesLate);
+			return;
+		}
+		// Line 153, where LY reads 0 for most of the line
+		video->lyForComparison = -1;
+		_statUpdate(video);
+		_ppuSchedule(video, PPU_LINE153_LY, 2, cyclesLate);
+		return;
+	case PPU_LINE153_LY:
+		gb->memory.io[GB_REG_LY] = 153;
+		_ppuSchedule(video, PPU_LINE153_LY0, cgb ? 2 : 4, cyclesLate);
+		return;
+	case PPU_LINE153_LY0:
+		if (!cgb && !gb->doubleSpeed) {
+			gb->memory.io[GB_REG_LY] = 0;
+		}
+		video->lyForComparison = 153;
+		_statUpdate(video);
+		_ppuSchedule(video, PPU_LINE153_LYC, cgb ? 4 : 2, cyclesLate);
+		return;
+	case PPU_LINE153_LYC:
+		gb->memory.io[GB_REG_LY] = 0;
+		video->lyForComparison = cgb ? 153 : -1;
+		_statUpdate(video);
+		_ppuSchedule(video, PPU_LINE153_LYC0, 4, cyclesLate);
+		return;
+	case PPU_LINE153_LYC0:
+		video->lyForComparison = 0;
+		_statUpdate(video);
+		_ppuSchedule(video, PPU_LINE153_HOLD, 12, cyclesLate);
+		return;
+	case PPU_LINE153_HOLD:
+		_ppuSchedule(video, PPU_LINE153_NEXT, GB_VIDEO_HORIZONTAL_LENGTH - 24, cyclesLate);
+		return;
+	case PPU_LINE153_NEXT:
+		video->ly = 0;
+		video->wyTriggered = false;
+		_startLine(video, cyclesLate);
+		return;
+	}
 }
 
 void GBVideoSkipBIOS(struct GBVideo* video) {
-	video->mode = 1;
-	video->modeEvent.callback = _endMode1;
-
-	int32_t next;
+	_blockAll(video, false);
+	video->modeForInterrupt = 1;
+	_setMode(video, 1);
+	mTimingDeschedule(&video->p->timing, &video->modeEvent);
 	if (video->p->model & GB_MODEL_CGB) {
 		int i;
 		for (i = 0; i < 0x40; ++i) {
 			video->palette[i] = 0x7FFF;
 			video->renderer->writePalette(video->renderer, i, video->palette[i]);
 		}
+		// VBlank on LY 144, 18 dots before the next line
 		video->ly = GB_VIDEO_VERTICAL_PIXELS;
 		video->p->memory.io[GB_REG_LY] = video->ly;
-		video->stat = GBRegisterSTATClearLYC(video->stat);
-		next = 20;
+		video->lyForComparison = video->ly;
+		_ppuSchedule(video, PPU_VBLANK_NEXT, 18, 0);
 	} else {
-		video->ly = GB_VIDEO_VERTICAL_TOTAL_PIXELS;
+		// The end of line 153, where LY already reads 0
+		video->ly = GB_VIDEO_VERTICAL_TOTAL_PIXELS - 1;
 		video->p->memory.io[GB_REG_LY] = 0;
-		next = 56;
+		video->lyForComparison = 0;
+		_ppuSchedule(video, PPU_LINE153_NEXT, 53, 0);
 	}
-	video->stat = GBRegisterSTATSetMode(video->stat, video->mode);
+	video->stat = GBRegisterSTATClearLYC(video->stat);
+	_statUpdate(video);
 
 	video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_VBLANK);
 	GBUpdateIRQs(video->p);
 	video->p->memory.io[GB_REG_STAT] = video->stat;
-	mTimingDeschedule(&video->p->timing, &video->modeEvent);
-	mTimingSchedule(&video->p->timing, &video->modeEvent, next << 1);
-}
-
-void _endMode0(struct mTiming* timing, void* context, uint32_t cyclesLate) {
-	struct GBVideo* video = context;
-	if (video->frameskipCounter <= 0) {
-		video->renderer->finishScanline(video->renderer, video->ly);
-	}
-	int lyc = video->p->memory.io[GB_REG_LYC];
-	int32_t next;
-	++video->ly;
-	video->p->memory.io[GB_REG_LY] = video->ly;
-	GBRegisterSTAT oldStat = video->stat;
-	if (video->ly < GB_VIDEO_VERTICAL_PIXELS) {
-		next = GB_VIDEO_MODE_2_LENGTH;
-		video->mode = 2;
-		video->modeEvent.callback = _endMode2;
-	} else {
-		next = GB_VIDEO_HORIZONTAL_LENGTH;
-		video->mode = 1;
-		video->modeEvent.callback = _endMode1;
-
-		mTimingDeschedule(&video->p->timing, &video->frameEvent);
-		mTimingSchedule(&video->p->timing, &video->frameEvent, -cyclesLate);
-
-		if (!_statIRQAsserted(oldStat) && GBRegisterSTATIsOAMIRQ(video->stat)) {
-			video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
-		}
-		video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_VBLANK);
-	}
-	video->stat = GBRegisterSTATSetMode(video->stat, video->mode);
-	if (!_statIRQAsserted(oldStat) && _statIRQAsserted(video->stat)) {
-		video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
-	}
-
-	// LYC stat is delayed 1 T-cycle
-	oldStat = video->stat;
-	video->stat = GBRegisterSTATSetLYC(video->stat, lyc == video->ly);
-	if (!_statIRQAsserted(oldStat) && _statIRQAsserted(video->stat)) {
-		video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
-	}
-
-	GBUpdateIRQs(video->p);
-	video->p->memory.io[GB_REG_STAT] = video->stat;
-	mTimingSchedule(timing, &video->modeEvent, (next << 1) - cyclesLate);
-}
-
-void _endMode1(struct mTiming* timing, void* context, uint32_t cyclesLate) {
-	struct GBVideo* video = context;
-	if (!GBRegisterLCDCIsEnable(video->p->memory.io[GB_REG_LCDC])) {
-		return;
-	}
-	int lyc = video->p->memory.io[GB_REG_LYC];
-	// TODO: One M-cycle delay
-	++video->ly;
-	int32_t next;
-	if (video->ly == GB_VIDEO_VERTICAL_TOTAL_PIXELS + 1) {
-		video->ly = 0;
-		video->p->memory.io[GB_REG_LY] = video->ly;
-		next = GB_VIDEO_MODE_2_LENGTH;
-		video->mode = 2;
-		video->modeEvent.callback = _endMode2;
-	} else if (video->ly == GB_VIDEO_VERTICAL_TOTAL_PIXELS) {
-		video->p->memory.io[GB_REG_LY] = 0;
-		next = GB_VIDEO_HORIZONTAL_LENGTH - 8;
-	} else if (video->ly == GB_VIDEO_VERTICAL_TOTAL_PIXELS - 1) {
-		video->p->memory.io[GB_REG_LY] = video->ly;
-		next = 8;
-	} else {
-		video->p->memory.io[GB_REG_LY] = video->ly;
-		next = GB_VIDEO_HORIZONTAL_LENGTH;
-	}
-
-	GBRegisterSTAT oldStat = video->stat;
-	video->stat = GBRegisterSTATSetMode(video->stat, video->mode);
-	video->stat = GBRegisterSTATSetLYC(video->stat, lyc == video->p->memory.io[GB_REG_LY]);
-	if (!_statIRQAsserted(oldStat) && _statIRQAsserted(video->stat)) {
-		video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
-		GBUpdateIRQs(video->p);
-	}
-	video->p->memory.io[GB_REG_STAT] = video->stat;
-	mTimingSchedule(timing, &video->modeEvent, (next << 1) - cyclesLate);
-}
-
-void _endMode2(struct mTiming* timing, void* context, uint32_t cyclesLate) {
-	struct GBVideo* video = context;
-	_cleanOAM(video, video->ly);
-	video->x = -(video->p->memory.io[GB_REG_SCX] & 7);
-	video->dotClock = mTimingCurrentTime(timing) - cyclesLate + 10 - (video->x << 1);
-	int32_t next = GB_VIDEO_MODE_3_LENGTH_BASE + video->objMax * 6 - video->x;
-	video->mode = 3;
-	video->modeEvent.callback = _endMode3;
-	GBRegisterSTAT oldStat = video->stat;
-	video->stat = GBRegisterSTATSetMode(video->stat, video->mode);
-	if (!_statIRQAsserted(oldStat) && _statIRQAsserted(video->stat)) {
-		video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
-		GBUpdateIRQs(video->p);
-	}
-	video->p->memory.io[GB_REG_STAT] = video->stat;
-	mTimingSchedule(timing, &video->modeEvent, (next << 1) - cyclesLate);
-}
-
-void _endMode3(struct mTiming* timing, void* context, uint32_t cyclesLate) {
-	struct GBVideo* video = context;
-	GBVideoProcessDots(video, cyclesLate);
-	if (video->ly < GB_VIDEO_VERTICAL_PIXELS && video->p->memory.isHdma && video->p->memory.io[GB_REG_HDMA5] != 0xFF) {
-		video->p->memory.hdmaRemaining = 0x10;
-		video->p->cpuBlocked = true;
-		mTimingDeschedule(timing, &video->p->memory.hdmaEvent);
-		mTimingSchedule(timing, &video->p->memory.hdmaEvent, 0);
-	}
-	video->mode = 0;
-	video->modeEvent.callback = _endMode0;
-	GBRegisterSTAT oldStat = video->stat;
-	video->stat = GBRegisterSTATSetMode(video->stat, video->mode);
-	if (!_statIRQAsserted(oldStat) && _statIRQAsserted(video->stat)) {
-		video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
-		GBUpdateIRQs(video->p);
-	}
-	video->p->memory.io[GB_REG_STAT] = video->stat;
-	// TODO: Cache SCX & 7 in case it changes
-	int32_t next = GB_VIDEO_MODE_0_LENGTH_BASE - video->objMax * 6 - (video->p->memory.io[GB_REG_SCX] & 7);
-	if (video->lcdOnLine) {
-		next -= 3;
-		video->lcdOnLine = false;
-	}
-	mTimingSchedule(timing, &video->modeEvent, (next << 1) - cyclesLate);
 }
 
 void _updateFrameCount(struct mTiming* timing, void* context, uint32_t cyclesLate) {
@@ -733,71 +1126,71 @@ void GBVideoProcessDots(struct GBVideo* video, uint32_t cyclesLate) {
 }
 
 void GBVideoWriteLCDC(struct GBVideo* video, GBRegisterLCDC value) {
-	if (!GBRegisterLCDCIsEnable(video->p->memory.io[GB_REG_LCDC]) && GBRegisterLCDCIsEnable(value)) {
-		video->mode = 2;
-		video->modeEvent.callback = _endMode2;
-		// The first line after the LCD turns on starts a little late, and catches up in its HBlank
-		int32_t next = GB_VIDEO_MODE_2_LENGTH - 2;
-		video->lcdOnLine = true;
-		mTimingDeschedule(&video->p->timing, &video->modeEvent);
-		mTimingSchedule(&video->p->timing, &video->modeEvent, next << 1);
-
+	struct GB* gb = video->p;
+	if (!GBRegisterLCDCIsEnable(gb->memory.io[GB_REG_LCDC]) && GBRegisterLCDCIsEnable(value)) {
+		gb->memory.io[GB_REG_LCDC] = value;
+		// Line 0 starts with mode 0, a T-cycle after the write on a DMG and as it happens on a CGB
 		video->ly = 0;
-		video->p->memory.io[GB_REG_LY] = 0;
-		GBRegisterSTAT oldStat = video->stat;
-		video->stat = GBRegisterSTATSetMode(video->stat, 0);
-		video->stat = GBRegisterSTATSetLYC(video->stat, video->ly == video->p->memory.io[GB_REG_LYC]);
-		if (!_statIRQAsserted(oldStat) && _statIRQAsserted(video->stat)) {
-			video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
-			GBUpdateIRQs(video->p);
-		}
-		video->p->memory.io[GB_REG_STAT] = video->stat;
+		gb->memory.io[GB_REG_LY] = 0;
+		video->wyTriggered = false;
+		video->lyForComparison = 0;
+		_setMode(video, 0);
+		video->modeForInterrupt = -1;
+		_blockAll(video, false);
+		video->lineCycles = GB_VIDEO_MODE_2_LENGTH - 4;
+		_statUpdate(video);
 		video->renderer->writePalette(video->renderer, 0, video->palette[0]);
 
-		mTimingDeschedule(&video->p->timing, &video->frameEvent);
+		int t = gb->cpu->tMultiplier;
+		video->ppuState = PPU_LCDON_OAM;
+		mTimingDeschedule(&gb->timing, &video->modeEvent);
+		mTimingSchedule(&gb->timing, &video->modeEvent, ((GB_VIDEO_MODE_2_LENGTH - 4) << 1) - t + (_isCGB(video) ? 0 : 2));
+		mTimingDeschedule(&gb->timing, &video->frameEvent);
 	}
-	if (GBRegisterLCDCIsEnable(video->p->memory.io[GB_REG_LCDC]) && !GBRegisterLCDCIsEnable(value)) {
-		// TODO: Fix serialization; this gets internal and visible modes out of sync
-		video->mode = 0;
-		video->stat = GBRegisterSTATSetMode(video->stat, 0);
-		video->p->memory.io[GB_REG_STAT] = video->stat;
+	if (GBRegisterLCDCIsEnable(gb->memory.io[GB_REG_LCDC]) && !GBRegisterLCDCIsEnable(value)) {
+		// When the LCD is off, LY is 0, STAT shows mode 0 and everything is open
+		video->ppuState = PPU_OFF;
+		_setMode(video, 0);
 		video->ly = 0;
-		video->p->memory.io[GB_REG_LY] = 0;
+		gb->memory.io[GB_REG_LY] = 0;
+		video->lyForComparison = 0;
+		video->wyTriggered = false;
+		_blockAll(video, false);
 		video->renderer->writePalette(video->renderer, 0, video->dmgPalette[0]);
 
-		mTimingDeschedule(&video->p->timing, &video->modeEvent);
-		mTimingDeschedule(&video->p->timing, &video->frameEvent);
-		mTimingSchedule(&video->p->timing, &video->frameEvent, GB_VIDEO_TOTAL_LENGTH << 1);
+		mTimingDeschedule(&gb->timing, &video->modeEvent);
+		mTimingDeschedule(&gb->timing, &video->frameEvent);
+		mTimingSchedule(&gb->timing, &video->frameEvent, GB_VIDEO_TOTAL_LENGTH << 1);
 	}
-	video->p->memory.io[GB_REG_STAT] = video->stat;
+	gb->memory.io[GB_REG_STAT] = video->stat;
 }
 
 void GBVideoWriteSTAT(struct GBVideo* video, GBRegisterSTAT value) {
-	GBRegisterSTAT oldStat = video->stat;
 	video->stat = (video->stat & 0x7) | (value & 0x78);
-	if (!GBRegisterLCDCIsEnable(video->p->memory.io[GB_REG_LCDC]) || video->p->model >= GB_MODEL_CGB) {
-		return;
-	}
-	// Writing to STAT on a DMG selects all STAT IRQ types for one cycle.
-	// However, the signal that the mode 2 IRQ relies on is only high for
-	// one cycle, which we don't handle yet. TODO: Handle it.
-	if (!_statIRQAsserted(oldStat) && (video->mode < 2 || GBRegisterSTATIsLYC(video->stat))) {
-		// TODO: variable for the IRQ line value?
-		video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
-		GBUpdateIRQs(video->p);
-	}
+	_statUpdate(video);
 }
 
 void GBVideoWriteLYC(struct GBVideo* video, uint8_t value) {
-	GBRegisterSTAT oldStat = video->stat;
-	if (GBRegisterLCDCIsEnable(video->p->memory.io[GB_REG_LCDC])) {
-		video->stat = GBRegisterSTATSetLYC(video->stat, value == video->ly);
-		if (!_statIRQAsserted(oldStat) && _statIRQAsserted(video->stat)) {
-			video->p->memory.io[GB_REG_IF] |= (1 << GB_IRQ_LCDSTAT);
-			GBUpdateIRQs(video->p);
+	struct GB* gb = video->p;
+	bool cgb = _isCGB(video);
+	if (video->ppuState == PPU_LINE153_HOLD && cgb) {
+		video->lyForComparison = 153;
+		_statUpdate(video);
+		video->lyForComparison = 0;
+	}
+	gb->memory.io[GB_REG_LYC] = value;
+	// On a CGB, a write as LY changes is seen when the PPU compares
+	if (!cgb || (video->ppuState != PPU_LINE_OAM && video->ppuState != PPU_VBLANK_LY &&
+	             video->ppuState != PPU_LINE153_LYC && video->ppuState != PPU_LINE153_LYC0)) {
+		if (video->ppuState == PPU_LINE153_LY0 && cgb) {
+			video->lyForComparison = 153;
+			_statUpdate(video);
+			video->lyForComparison = -1;
+		} else {
+			_statUpdate(video);
 		}
 	}
-	video->p->memory.io[GB_REG_STAT] = video->stat;
+	gb->memory.io[GB_REG_STAT] = video->stat;
 }
 
 void GBVideoWritePalette(struct GBVideo* video, uint16_t address, uint8_t value) {
@@ -837,7 +1230,7 @@ void GBVideoWritePalette(struct GBVideo* video, uint16_t address, uint8_t value)
 	} else if (video->p->model >= GB_MODEL_CGB) {
 		switch (address) {
 		case GB_REG_BCPD:
-			if (video->mode != 3) {
+			if (!video->paletteBlocked) {
 				if (video->bcpIndex & 1) {
 					video->palette[video->bcpIndex >> 1] &= 0x00FF;
 					video->palette[video->bcpIndex >> 1] |= value << 8;
@@ -856,7 +1249,7 @@ void GBVideoWritePalette(struct GBVideo* video, uint16_t address, uint8_t value)
 			video->p->memory.io[GB_REG_BCPD] = video->palette[video->bcpIndex >> 1] >> (8 * (video->bcpIndex & 1));
 			break;
 		case GB_REG_OCPD:
-			if (video->mode != 3) {
+			if (!video->paletteBlocked) {
 				if (video->ocpIndex & 1) {
 					video->palette[8 * 4 + (video->ocpIndex >> 1)] &= 0x00FF;
 					video->palette[8 * 4 + (video->ocpIndex >> 1)] |= value << 8;
@@ -1145,7 +1538,6 @@ void GBVideoSerialize(const struct GBVideo* video, struct GBSerializedState* sta
 	flags = GBSerializedVideoFlagsSetMode(flags, video->mode);
 	flags = GBSerializedVideoFlagsSetNotModeEventScheduled(flags, !mTimingIsScheduled(&video->p->timing, &video->modeEvent));
 	flags = GBSerializedVideoFlagsSetNotFrameEventScheduled(flags, !mTimingIsScheduled(&video->p->timing, &video->frameEvent));
-	flags = GBSerializedVideoFlagsSetLcdOnLine(flags, video->lcdOnLine);
 	state->video.flags = flags;
 	STORE_16LE(video->bcpIndex, 0, &state->video.bcpIndex);
 	STORE_16LE(video->ocpIndex, 0, &state->video.ocpIndex);
@@ -1160,6 +1552,21 @@ void GBVideoSerialize(const struct GBVideo* video, struct GBSerializedState* sta
 
 	memcpy(state->vram, video->vram, GB_SIZE_VRAM);
 	memcpy(state->oam, &video->oam.raw, GB_SIZE_OAM);
+
+	state->ppu.state = video->ppuState;
+	state->ppu.modeForInterrupt = video->modeForInterrupt;
+	STORE_16LE(video->lyForComparison, 0, &state->ppu.lyForComparison);
+	STORE_16LE(video->lineCycles, 0, &state->ppu.lineCycles);
+	GBSerializedPPUFlags ppuFlags = 0;
+	ppuFlags = GBSerializedPPUFlagsSetStatLine(ppuFlags, video->statLine);
+	ppuFlags = GBSerializedPPUFlagsSetLycLine(ppuFlags, video->lycLine);
+	ppuFlags = GBSerializedPPUFlagsSetWyTriggered(ppuFlags, video->wyTriggered);
+	ppuFlags = GBSerializedPPUFlagsSetOamReadBlocked(ppuFlags, video->oamReadBlocked);
+	ppuFlags = GBSerializedPPUFlagsSetOamWriteBlocked(ppuFlags, video->oamWriteBlocked);
+	ppuFlags = GBSerializedPPUFlagsSetVramReadBlocked(ppuFlags, video->vramReadBlocked);
+	ppuFlags = GBSerializedPPUFlagsSetVramWriteBlocked(ppuFlags, video->vramWriteBlocked);
+	ppuFlags = GBSerializedPPUFlagsSetPaletteBlocked(ppuFlags, video->paletteBlocked);
+	state->ppu.flags = ppuFlags;
 }
 
 void GBVideoDeserialize(struct GBVideo* video, const struct GBSerializedState* state) {
@@ -1175,25 +1582,44 @@ void GBVideoDeserialize(struct GBVideo* video, const struct GBSerializedState* s
 	video->bcpIncrement = GBSerializedVideoFlagsGetBcpIncrement(flags);
 	video->ocpIncrement = GBSerializedVideoFlagsGetOcpIncrement(flags);
 	video->mode = GBSerializedVideoFlagsGetMode(flags);
-	video->lcdOnLine = GBSerializedVideoFlagsGetLcdOnLine(flags);
+	video->ppuState = state->ppu.state;
+	video->modeForInterrupt = state->ppu.modeForInterrupt;
+	int16_t lyForComparison;
+	LOAD_16LE(lyForComparison, 0, &state->ppu.lyForComparison);
+	video->lyForComparison = lyForComparison;
+	int16_t lineCycles;
+	LOAD_16LE(lineCycles, 0, &state->ppu.lineCycles);
+	video->lineCycles = lineCycles;
+	GBSerializedPPUFlags ppuFlags = state->ppu.flags;
+	video->statLine = GBSerializedPPUFlagsGetStatLine(ppuFlags);
+	video->lycLine = GBSerializedPPUFlagsGetLycLine(ppuFlags);
+	video->wyTriggered = GBSerializedPPUFlagsGetWyTriggered(ppuFlags);
+	video->oamReadBlocked = GBSerializedPPUFlagsGetOamReadBlocked(ppuFlags);
+	video->oamWriteBlocked = GBSerializedPPUFlagsGetOamWriteBlocked(ppuFlags);
+	video->vramReadBlocked = GBSerializedPPUFlagsGetVramReadBlocked(ppuFlags);
+	video->vramWriteBlocked = GBSerializedPPUFlagsGetVramWriteBlocked(ppuFlags);
+	video->paletteBlocked = GBSerializedPPUFlagsGetPaletteBlocked(ppuFlags);
 	LOAD_16LE(video->bcpIndex, 0, &state->video.bcpIndex);
 	video->bcpIndex &= 0x3F;
 	LOAD_16LE(video->ocpIndex, 0, &state->video.ocpIndex);
 	video->ocpIndex &= 0x3F;
 
-	switch (video->mode) {
-	case 0:
-		video->modeEvent.callback = _endMode0;
-		break;
-	case 1:
-		video->modeEvent.callback = _endMode1;
-		break;
-	case 2:
-		video->modeEvent.callback = _endMode2;
-		break;
-	case 3:
-		video->modeEvent.callback = _endMode3;
-		break;
+	video->modeEvent.callback = _ppuStep;
+	if (video->ppuState == PPU_OFF && GBRegisterLCDCIsEnable(state->io[GB_REG_LCDC])) {
+		// A state from before the PPU kept its own steps: resume at the step that ends the mode it was in
+		static const int resume[4] = { PPU_LINE_NEXT, PPU_VBLANK_NEXT, PPU_LINE_MODE3, PPU_MODE3_END };
+		video->ppuState = resume[video->mode & 3];
+		if (video->mode == 1 && video->ly >= GB_VIDEO_VERTICAL_TOTAL_PIXELS - 1) {
+			video->ppuState = PPU_LINE153_NEXT;
+		}
+		video->modeForInterrupt = video->mode == 3 ? 3 : video->mode;
+		video->lyForComparison = state->io[GB_REG_LY];
+		video->lineCycles = video->mode == 3 ? 89 + 167 + (state->io[GB_REG_SCX] & 7) : GB_VIDEO_MODE_2_LENGTH + 4;
+		video->oamReadBlocked = video->mode >= 2;
+		video->oamWriteBlocked = video->mode >= 2;
+		video->vramReadBlocked = video->mode == 3;
+		video->vramWriteBlocked = video->mode == 3;
+		video->paletteBlocked = video->mode == 3;
 	}
 
 	uint32_t when;
@@ -1223,5 +1649,6 @@ void GBVideoDeserialize(struct GBVideo* video, const struct GBSerializedState* s
 	memcpy(&video->oam.raw, state->oam, GB_SIZE_OAM);
 
 	_cleanOAM(video, video->ly);
+	_scanObjects(video);
 	GBVideoSwitchBank(video, video->vramCurrentBank);
 }

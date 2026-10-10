@@ -164,7 +164,8 @@ mLOG_DECLARE_CATEGORY(GB_STATE);
  * | 0x00197: Reserved (leave zero)
  * 0x00198 - 0x0019F: Global cycle counter
  * 0x001A0 - 0x001A1: Program counter for last cartridge read
- * 0x001A2 - 0x001D7: Reserved (leave zero)
+ * 0x001A2 - 0x001A9: PPU timing state
+ * 0x001AA - 0x001D7: Reserved (leave zero)
  * 0x001D8 - 0x0025F: Additional audio state
  * | 0x001D8 - 0x001DB: Last sample timestamp
  * | 0x001DC: Current audio sample index
@@ -267,7 +268,16 @@ DECL_BIT(GBSerializedVideoFlags, OcpIncrement, 1);
 DECL_BITS(GBSerializedVideoFlags, Mode, 2, 2);
 DECL_BIT(GBSerializedVideoFlags, NotModeEventScheduled, 4);
 DECL_BIT(GBSerializedVideoFlags, NotFrameEventScheduled, 5);
-DECL_BIT(GBSerializedVideoFlags, LcdOnLine, 6);
+
+DECL_BITFIELD(GBSerializedPPUFlags, uint8_t);
+DECL_BIT(GBSerializedPPUFlags, StatLine, 0);
+DECL_BIT(GBSerializedPPUFlags, LycLine, 1);
+DECL_BIT(GBSerializedPPUFlags, WyTriggered, 2);
+DECL_BIT(GBSerializedPPUFlags, OamReadBlocked, 3);
+DECL_BIT(GBSerializedPPUFlags, OamWriteBlocked, 4);
+DECL_BIT(GBSerializedPPUFlags, VramReadBlocked, 5);
+DECL_BIT(GBSerializedPPUFlags, VramWriteBlocked, 6);
+DECL_BIT(GBSerializedPPUFlags, PaletteBlocked, 7);
 
 DECL_BITFIELD(GBSerializedMBC6Flags, uint8_t);
 DECL_BIT(GBSerializedMBC6Flags, FlashBank0, 0);
@@ -479,7 +489,16 @@ struct GBSerializedState {
 
 	uint16_t cartBusPc;
 
-	uint16_t reserved[27];
+	struct {
+		uint8_t state;
+		int8_t modeForInterrupt;
+		int16_t lyForComparison;
+		int16_t lineCycles;
+		GBSerializedPPUFlags flags;
+		uint8_t reserved;
+	} ppu;
+
+	uint16_t reserved[23];
 
 	struct {
 		int32_t lastSample;

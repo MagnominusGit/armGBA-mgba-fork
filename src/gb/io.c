@@ -647,6 +647,13 @@ uint8_t GBIORead(struct GB* gb, unsigned address) {
 	case GB_REG_WX:
 		// Handled transparently by the registers
 		break;
+	case GB_REG_BCPD:
+	case GB_REG_OCPD:
+		// Palette data reads as 0xFF while the PPU holds the palettes
+		if (gb->model >= GB_MODEL_CGB && gb->video.paletteBlocked) {
+			return 0xFF;
+		}
+		// Fall through
 	case GB_REG_KEY1:
 	case GB_REG_VBK:
 	case GB_REG_HDMA1:
@@ -655,9 +662,7 @@ uint8_t GBIORead(struct GB* gb, unsigned address) {
 	case GB_REG_HDMA4:
 	case GB_REG_HDMA5:
 	case GB_REG_BCPS:
-	case GB_REG_BCPD:
 	case GB_REG_OCPS:
-	case GB_REG_OCPD:
 	case GB_REG_SVBK:
 	case GB_REG_PSWX:
 	case GB_REG_PSWY:
@@ -717,6 +722,13 @@ int GBIOReadDirect(struct GB* gb, unsigned address) {
 	case GB_REG_WY:
 	case GB_REG_WX:
 		return gb->memory.io[address] | _registerMask[address];
+	case GB_REG_BCPD:
+	case GB_REG_OCPD:
+		// Palette data reads as 0xFF while the PPU holds the palettes
+		if (gb->model >= GB_MODEL_CGB && gb->video.paletteBlocked) {
+			return 0xFF;
+		}
+		// Fall through
 	case GB_REG_KEY1:
 	case GB_REG_VBK:
 	case GB_REG_HDMA1:
@@ -725,9 +737,7 @@ int GBIOReadDirect(struct GB* gb, unsigned address) {
 	case GB_REG_HDMA4:
 	case GB_REG_HDMA5:
 	case GB_REG_BCPS:
-	case GB_REG_BCPD:
 	case GB_REG_OCPS:
-	case GB_REG_OCPD:
 	case GB_REG_SVBK:
 	case GB_REG_PSWX:
 	case GB_REG_PSWY:

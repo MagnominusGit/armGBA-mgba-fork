@@ -302,7 +302,7 @@ uint8_t GBLoad8(struct SM83Core* cpu, uint16_t address) {
 		return memory->cartBus;
 	case GB_REGION_VRAM:
 	case GB_REGION_VRAM + 1:
-		if (gb->video.mode != 3) {
+		if (!gb->video.vramReadBlocked) {
 			return gb->video.vramBank[address & (GB_SIZE_VRAM_BANK0 - 1)];
 		}
 		return 0xFF;
@@ -337,7 +337,7 @@ uint8_t GBLoad8(struct SM83Core* cpu, uint16_t address) {
 			return memory->wramBank[address & (GB_SIZE_WORKING_RAM_BANK0 - 1)];
 		}
 		if (address < GB_BASE_UNUSABLE) {
-			if (gb->video.mode < 2) {
+			if (!gb->video.oamReadBlocked) {
 				return gb->video.oam.raw[address & 0xFF];
 			}
 			return 0xFF;
@@ -384,7 +384,7 @@ void GBStore8(struct SM83Core* cpu, uint16_t address, int8_t value) {
 		return;
 	case GB_REGION_VRAM:
 	case GB_REGION_VRAM + 1:
-		if (gb->video.mode != 3) {
+		if (!gb->video.vramWriteBlocked) {
 			gb->video.renderer->writeVRAM(gb->video.renderer, (address & (GB_SIZE_VRAM_BANK0 - 1)) | (GB_SIZE_VRAM_BANK0 * gb->video.vramCurrentBank));
 			gb->video.vramBank[address & (GB_SIZE_VRAM_BANK0 - 1)] = value;
 		}
@@ -419,7 +419,7 @@ void GBStore8(struct SM83Core* cpu, uint16_t address, int8_t value) {
 		if (address < GB_BASE_OAM) {
 			memory->wramBank[address & (GB_SIZE_WORKING_RAM_BANK0 - 1)] = value;
 		} else if (address < GB_BASE_UNUSABLE) {
-			if (gb->video.mode < 2) {
+			if (!gb->video.oamWriteBlocked) {
 				gb->video.oam.raw[address & 0xFF] = value;
 				gb->video.renderer->writeOAM(gb->video.renderer, address & 0xFF);
 			}

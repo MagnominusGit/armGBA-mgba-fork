@@ -143,6 +143,7 @@ struct GBVideo {
 
 	struct mTimingEvent modeEvent;
 	struct mTimingEvent frameEvent;
+	struct mTimingEvent irqEvent;
 
 	int32_t dotClock;
 
@@ -152,7 +153,22 @@ struct GBVideo {
 
 	union GBOAM oam;
 	int objMax;
-	bool lcdOnLine;
+
+	// PPU timing, step by step as the hardware runs a line
+	int ppuState;
+	int lineCycles;
+	int modeForInterrupt;
+	int lyForComparison;
+	bool statLine;
+	bool lycLine;
+	bool wyTriggered;
+	bool oamReadBlocked;
+	bool oamWriteBlocked;
+	bool vramReadBlocked;
+	bool vramWriteBlocked;
+	bool paletteBlocked;
+	int lineObjCount;
+	uint8_t lineObjX[GB_VIDEO_MAX_LINE_OBJ];
 
 	int bcpIndex;
 	bool bcpIncrement;
