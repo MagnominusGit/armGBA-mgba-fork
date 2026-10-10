@@ -6,6 +6,7 @@ set(SOURCE_FILES
 	gb.c
 	input.c
 	io.c
+	jit.c
 	mbc.c
 	mbc/huc-3.c
 	mbc/licensed.c

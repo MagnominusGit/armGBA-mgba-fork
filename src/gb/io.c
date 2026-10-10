@@ -665,6 +665,71 @@ uint8_t GBIORead(struct GB* gb, unsigned address) {
 	return gb->memory.io[address] | _registerMask[address];
 }
 
+int GBIOReadDirect(struct GB* gb, unsigned address) {
+	switch (address) {
+	case GB_REG_IE:
+		return gb->memory.ie;
+	case GB_REG_SB:
+	case GB_REG_SC:
+	case GB_REG_IF:
+	case GB_REG_NR10:
+	case GB_REG_NR11:
+	case GB_REG_NR12:
+	case GB_REG_NR14:
+	case GB_REG_NR21:
+	case GB_REG_NR22:
+	case GB_REG_NR24:
+	case GB_REG_NR30:
+	case GB_REG_NR32:
+	case GB_REG_NR34:
+	case GB_REG_NR41:
+	case GB_REG_NR42:
+	case GB_REG_NR43:
+	case GB_REG_NR44:
+	case GB_REG_NR50:
+	case GB_REG_NR51:
+	case GB_REG_NR52:
+	case GB_REG_DIV:
+	case GB_REG_TIMA:
+	case GB_REG_TMA:
+	case GB_REG_TAC:
+	case GB_REG_STAT:
+	case GB_REG_LCDC:
+	case GB_REG_SCY:
+	case GB_REG_SCX:
+	case GB_REG_LY:
+	case GB_REG_LYC:
+	case GB_REG_DMA:
+	case GB_REG_BGP:
+	case GB_REG_OBP0:
+	case GB_REG_OBP1:
+	case GB_REG_WY:
+	case GB_REG_WX:
+		return gb->memory.io[address] | _registerMask[address];
+	case GB_REG_KEY1:
+	case GB_REG_VBK:
+	case GB_REG_HDMA1:
+	case GB_REG_HDMA2:
+	case GB_REG_HDMA3:
+	case GB_REG_HDMA4:
+	case GB_REG_HDMA5:
+	case GB_REG_BCPS:
+	case GB_REG_BCPD:
+	case GB_REG_OCPS:
+	case GB_REG_OCPD:
+	case GB_REG_SVBK:
+	case GB_REG_PSWX:
+	case GB_REG_PSWY:
+	case GB_REG_UNK75:
+		if (gb->model < GB_MODEL_CGB) {
+			return -1;
+		}
+		return gb->memory.io[address] | _registerMask[address];
+	default:
+		return -1;
+	}
+}
+
 void GBTestKeypadIRQ(struct GB* gb) {
 	_readKeys(gb);
 }

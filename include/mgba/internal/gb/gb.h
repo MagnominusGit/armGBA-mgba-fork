@@ -134,6 +134,8 @@ struct GB {
 	unsigned doubleSpeed;
 
 	bool allowOpposingDirections;
+
+	struct GBJit* jit;
 };
 
 struct GBCartridge {

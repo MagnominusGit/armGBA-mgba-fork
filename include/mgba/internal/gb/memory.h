@@ -364,6 +364,7 @@ void GBMemoryDeinit(struct GB* gb);
 void GBMemoryReset(struct GB* gb);
 void GBMemorySwitchWramBank(struct GBMemory* memory, int bank);
 
+uint8_t GBCartLoad8(struct SM83Core* cpu, uint16_t address);
 uint8_t GBLoad8(struct SM83Core* cpu, uint16_t address);
 void GBStore8(struct SM83Core* cpu, uint16_t address, int8_t value);
 

@@ -13,6 +13,7 @@
 #include <mgba/internal/gb/debugger/symbols.h>
 #include <mgba/internal/gb/io.h>
 #include <mgba/internal/gb/gb.h>
+#include <mgba/internal/gb/jit.h>
 #include <mgba/internal/gb/mbc.h>
 #include <mgba/internal/gb/overrides.h>
 #include <mgba/internal/gb/renderers/software.h>
@@ -159,6 +160,11 @@ static bool _GBCoreInit(struct mCore* core) {
 }
 
 static void _GBCoreDeinit(struct mCore* core) {
+	struct GB* gb = core->board;
+	if (gb->jit) {
+		GBJitDestroy(gb->jit);
+		gb->jit = NULL;
+	}
 	SM83Deinit(core->cpu);
 	GBDestroy(core->board);
 	mappedMemoryFree(core->cpu, sizeof(struct SM83Core));
@@ -209,6 +215,16 @@ static void _GBCoreLoadConfig(struct mCore* core, const struct mCoreConfig* conf
 		gb->audio.masterVolume = core->opts.volume;
 	}
 	gb->video.frameskip = core->opts.frameskip;
+
+	bool jit = false;
+	mCoreConfigGetBoolValue(config, "jit", &jit);
+	if (jit && !gb->jit) {
+		gb->jit = GBJitCreate(gb);
+	} else if (!jit && gb->jit) {
+		GBJitDestroy(gb->jit);
+		gb->jit = NULL;
+	}
+	gb->cpu->runJit = gb->jit ? GBJitRun : NULL;
 
 	int color;
 	if (mCoreConfigGetIntValue(config, "gb.pal[0]", &color)) {

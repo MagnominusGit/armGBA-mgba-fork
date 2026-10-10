@@ -9,6 +9,7 @@
 #include <mgba/internal/defines.h>
 #include <mgba/internal/gb/gb.h>
 #include <mgba/internal/gb/io.h>
+#include <mgba/internal/gb/jit.h>
 #include <mgba/internal/gb/mbc.h>
 #include <mgba/internal/gb/serialize.h>
 #include <mgba/internal/sm83/sm83.h>
@@ -53,7 +54,7 @@ static const uint8_t _blockedRegion[1] = { 0xFF };
 
 static void _pristineCow(struct GB* gba);
 
-static uint8_t GBCartLoad8(struct SM83Core* cpu, uint16_t address) {
+uint8_t GBCartLoad8(struct SM83Core* cpu, uint16_t address) {
 	if (UNLIKELY(address >= cpu->memory.activeRegionEnd)) {
 		cpu->memory.setActiveRegion(cpu, address);
 		return cpu->memory.cpuLoad8(cpu, address);
@@ -648,6 +649,9 @@ void GBPatch8(struct SM83Core* cpu, uint16_t address, int8_t value, int8_t* old,
 	struct GBMemory* memory = &gb->memory;
 	int8_t oldValue = -1;
 
+	if (address < GB_BASE_VRAM && gb->jit) {
+		GBJitFlush(gb->jit);
+	}
 	switch (address >> 12) {
 	case GB_REGION_CART_BANK0:
 	case GB_REGION_CART_BANK0 + 1:

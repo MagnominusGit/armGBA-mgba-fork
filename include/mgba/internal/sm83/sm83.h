@@ -146,6 +146,7 @@ struct SM83Core {
 	SM83Instruction instruction;
 
 	bool irqPending;
+	bool (*runJit)(struct SM83Core*);
 
 	struct SM83Memory memory;
 	struct SM83InterruptHandler irqh;

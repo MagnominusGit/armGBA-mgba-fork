@@ -7,6 +7,7 @@
 
 #include <mgba/internal/defines.h>
 #include <mgba/internal/gb/io.h>
+#include <mgba/internal/gb/jit.h>
 #include <mgba/internal/gb/mbc.h>
 #include <mgba/internal/sm83/sm83.h>
 
@@ -631,6 +632,9 @@ void GBReset(struct SM83Core* cpu) {
 	struct GB* gb = (struct GB*) cpu->master;
 	gb->memory.romBase = gb->memory.rom;
 	GBDetectModel(gb);
+	if (gb->jit) {
+		GBJitFlush(gb->jit);
+	}
 
 	cpu->b = 0;
 	cpu->d = 0;
