@@ -99,6 +99,8 @@ struct GB {
 	struct GBApu apu;
 	struct GBSIO sio;
 	enum GBModel model;
+	// Hardware revision letter ('0', 'A'-'E'), or 0 for the usual DMG-B / CGB-E
+	char revision;
 	struct GBXMetadata gbx;
 
 	struct mCoreSync* sync;

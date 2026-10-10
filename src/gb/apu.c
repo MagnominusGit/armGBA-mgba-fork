@@ -41,10 +41,13 @@ enum {
 	SKIP_DIV_SKIP,
 };
 
-// mGBA's CGB is SameBoy's CGB-E; DMG, MGB and SGB share SameBoy's pre-CGB-D behavior
+// CGBs are CGB-E unless a revision is set; DMG, MGB and SGB share the behavior of CGB-C and older
 #define IS_CGB(GB) ((GB)->model >= GB_MODEL_CGB)
 #define IS_AGB(GB) ((GB)->model >= GB_MODEL_AGB)
-#define IS_CGB_DE(GB) (IS_CGB(GB) && !IS_AGB(GB))
+#define CGB_REVISION(GB) ((GB)->revision ? (GB)->revision : 'E')
+#define IS_CGB_DE(GB) (IS_CGB(GB) && !IS_AGB(GB) && CGB_REVISION(GB) >= 'D')
+#define IS_PRE_CGB_D(GB) (!IS_CGB(GB) || (!IS_AGB(GB) && CGB_REVISION(GB) <= 'C'))
+#define IS_CGB_B_OR_OLDER(GB) (IS_CGB(GB) && !IS_AGB(GB) && CGB_REVISION(GB) <= 'B')
 
 #define APU_STATE_MAGIC 0x31555041
 
@@ -161,7 +164,7 @@ static void _nrx2GlitchStep(uint8_t* volume, uint8_t value, uint8_t oldValue, ui
 }
 
 static void _nrx2Glitch(struct GB* gb, uint8_t* volume, uint8_t value, uint8_t oldValue, uint8_t* countdown, struct GBApuEnvelopeClock* lock) {
-	if (!IS_CGB(gb)) {
+	if (IS_PRE_CGB_D(gb)) {
 		_nrx2GlitchStep(volume, 0xFF, oldValue, countdown, lock);
 		_nrx2GlitchStep(volume, value, 0xFF, countdown, lock);
 	} else {
@@ -445,7 +448,8 @@ static void _init(struct GB* gb) {
 }
 
 static void _lengthGlitch(struct GB* gb, uint8_t value, bool lengthEnabled, uint16_t* pulseLength, unsigned index, uint16_t reload) {
-	if ((value & 0x40) && !lengthEnabled && (gb->apu.divDivider & 1) && *pulseLength) {
+	// CGB-B and older tick it whatever the new value, except on channel 4
+	if (((value & 0x40) || (index != CH_NOISE && IS_CGB_B_OR_OLDER(gb))) && !lengthEnabled && (gb->apu.divDivider & 1) && *pulseLength) {
 		--*pulseLength;
 		if (*pulseLength == 0) {
 			if (value & 0x80) {
@@ -491,7 +495,7 @@ static void _writeSquareControl(struct GB* gb, unsigned index, unsigned reg, uin
 			}
 			ch->delay = 6 - apu->lfDiv;
 			ch->sampleCountdown = (ch->sampleLength ^ 0x7FF) * 2 + ch->delay;
-			if (!IS_CGB(gb) && apu->lfDiv) {
+			if (IS_PRE_CGB_D(gb) && apu->lfDiv) {
 				ch->sampleCountdown += 2;
 				ch->delay += 2;
 			}
@@ -508,7 +512,7 @@ static void _writeSquareControl(struct GB* gb, unsigned index, unsigned reg, uin
 			// Retriggering an active channel starts it two ticks sooner
 			ch->delay = 4 - apu->lfDiv + extraDelay;
 			ch->sampleCountdown = (ch->sampleLength ^ 0x7FF) * 2 + ch->delay;
-			if (!IS_CGB(gb) && apu->lfDiv) {
+			if (IS_PRE_CGB_D(gb) && apu->lfDiv) {
 				ch->sampleCountdown += 2;
 				ch->delay += 2;
 			}
@@ -545,7 +549,7 @@ static void _writeSquareControl(struct GB* gb, unsigned index, unsigned reg, uin
 			} else {
 				apu->sweepLengthAddend = 0;
 			}
-			apu->channel1RestartHold = 2 - apu->lfDiv + IS_CGB(gb) * 2;
+			apu->channel1RestartHold = 2 - apu->lfDiv + (IS_CGB(gb) && CGB_REVISION(gb) != 'D') * 2;
 			apu->squareSweepCountdown = ((nr10 >> 4) & 7) ^ 7;
 		}
 	}
@@ -572,7 +576,7 @@ static void _writeNoiseControl(struct GB* gb, uint8_t value) {
 			ch->delta = 0;
 			ch->counterCountdown = divisor + 4;
 			if (divisor == 2) {
-				if (!IS_CGB(gb)) {
+				if (IS_PRE_CGB_D(gb)) {
 					ch->counterCountdown += apu->lfDiv;
 					if (!gb->doubleSpeed) {
 						ch->counterCountdown -= 1;
@@ -581,7 +585,7 @@ static void _writeNoiseControl(struct GB* gb, uint8_t value) {
 					ch->counterCountdown += 1 - apu->lfDiv;
 				}
 			} else {
-				if (!IS_CGB(gb)) {
+				if (IS_PRE_CGB_D(gb)) {
 					ch->counterCountdown += (const uint8_t[]) { 2, 1, 4, 3 }[ch->alignment & 3];
 				} else {
 					ch->counterCountdown += (const uint8_t[]) { 2, 1, 0, 3 }[ch->alignment & 3];
@@ -596,7 +600,7 @@ static void _writeNoiseControl(struct GB* gb, uint8_t value) {
 				}
 			}
 
-			if (!IS_CGB(gb)) {
+			if (IS_PRE_CGB_D(gb)) {
 				if (gb->doubleSpeed) {
 					if (!(io[GB_REG_NR43] & 0xF0) && (io[GB_REG_NR43] & 0x07)) {
 						ch->counterCountdown -= 1;
@@ -635,9 +639,30 @@ static uint16_t _effectiveNoiseCounter(struct GB* gb) {
 	if (IS_AGB(gb)) {
 		return counter;
 	}
-	if (IS_CGB(gb)) {
+	if (IS_CGB(gb) && CGB_REVISION(gb) == 'E') {
 		if (counter & ((gb->memory.io[GB_REG_NR43] & 8) ? 0x40 : 0x80)) {
 			counter |= 0xFF;
+		}
+		if (counter & 0x1000) {
+			counter |= 0x10;
+		}
+		return counter;
+	}
+	if (IS_CGB(gb) && CGB_REVISION(gb) == 'D') {
+		if (counter & ((gb->memory.io[GB_REG_NR43] & 8) ? 0x40 : 0x80)) {
+			counter |= 0xFF;
+		}
+		if (counter & 0x100) {
+			counter |= 0x1;
+		}
+		if (counter & 0x200) {
+			counter |= 0x2;
+		}
+		if (counter & 0x400) {
+			counter |= 0x4;
+		}
+		if (counter & 0x800) {
+			counter |= 0x8;
 		}
 		if (counter & 0x1000) {
 			counter |= 0x10;
@@ -660,7 +685,7 @@ static uint16_t _effectiveNoiseCounter(struct GB* gb) {
 		counter |= 0x4;
 	}
 	if (counter & 0x800) {
-		if (gb->memory.io[GB_REG_NR43] & 8) {
+		if ((gb->memory.io[GB_REG_NR43] & 8) || (IS_CGB(gb) && CGB_REVISION(gb) == 'B')) {
 			counter |= 0x400;
 		}
 		counter |= 0x8;
@@ -779,7 +804,7 @@ static void _write(struct GB* gb, unsigned reg, uint8_t value) {
 			if (apu->isActive[CH_WAVE]) {
 				if (apu->wave.sampleCountdown == 0 && !IS_AGB(gb)) {
 					apu->wave.currentSampleByte = wave[gb->cpu->pc & 0xF];
-				} else if (apu->wave.waveFormJustRead && !IS_CGB(gb)) {
+				} else if (apu->wave.waveFormJustRead && IS_PRE_CGB_D(gb)) {
 					apu->wave.currentSampleByte = wave[GB_REG_NR30 & 0xF];
 				}
 			}
@@ -865,15 +890,15 @@ static void _write(struct GB* gb, unsigned reg, uint8_t value) {
 			if (!divisor) {
 				divisor = 2;
 			}
-			if (IS_CGB(gb)) {
+			if (!IS_PRE_CGB_D(gb)) {
 				ch->counterCountdown = divisor + (divisor == 2 ? 0 : (const uint8_t[]) { 2, 1, 0, 3 }[ch->alignment & 3]);
 			} else {
 				ch->counterCountdown = divisor + (divisor == 2 ? 0 : (const uint8_t[]) { 2, 1, 4, 3 }[ch->alignment & 3]);
 			}
 			ch->delta = 0;
 		}
-		if (newBit && (!oldBit || !IS_CGB(gb))) {
-			if (!IS_CGB(gb)) {
+		if (newBit && (!oldBit || IS_PRE_CGB_D(gb))) {
+			if (IS_PRE_CGB_D(gb)) {
 				bool previousNarrow = ch->narrow;
 				ch->narrow = true;
 				_stepLfsr(gb);
@@ -915,7 +940,7 @@ void GBApuWrite(struct GB* gb, unsigned reg, uint8_t value) {
 		// Line the channels up with the steps of the system counter
 		apu->lastStep = now - (GBTimerCounter(&gb->timer) & 3) * (2 - gb->doubleSpeed);
 	}
-	if (reg == GB_REG_NR10 && !IS_CGB(gb) && apu->globalEnable) {
+	if (reg == GB_REG_NR10 && IS_PRE_CGB_D(gb) && apu->globalEnable) {
 		// Pre-CGB-D sweep calculations keep stepping on NR10 writes
 		if (apu->squareSweepCalculateCountdown > 3 && apu->enableZombieCalculateStepping) {
 			apu->squareSweepCalculateCountdown -= 2;

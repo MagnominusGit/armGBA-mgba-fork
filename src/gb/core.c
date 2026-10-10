@@ -272,6 +272,7 @@ static void _GBCoreLoadConfig(struct mCore* core, const struct mCoreConfig* conf
 	mCoreConfigCopyValue(&core->config, config, "cgb.model");
 	mCoreConfigCopyValue(&core->config, config, "cgb.hybridModel");
 	mCoreConfigCopyValue(&core->config, config, "cgb.sgbModel");
+	mCoreConfigCopyValue(&core->config, config, "gb.revision");
 	mCoreConfigCopyValue(&core->config, config, "gb.colors");
 	mCoreConfigCopyValue(&core->config, config, "useCgbColors");
 	mCoreConfigCopyValue(&core->config, config, "allowOpposingDirections");
@@ -644,6 +645,8 @@ static void _GBCoreReset(struct mCore* core) {
 			}
 		}
 	}
+	const char* revision = mCoreConfigGetValue(&core->config, "gb.revision");
+	gb->revision = revision ? revision[0] : 0;
 
 #ifdef ENABLE_VFS
 	if (!gb->biosVf && core->opts.useBios) {

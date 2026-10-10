@@ -742,8 +742,17 @@ void GBSkipBIOS(struct GB* gb) {
 		// Fall through
 	case GB_MODEL_DMG:
 		cpu->a = 1;
-		cpu->f.packed = 0xB0;
 		cpu->c = 0x13;
+		if (gb->revision == '0') {
+			cpu->f.packed = 0x00;
+			cpu->b = 0xFF;
+			cpu->e = 0xC1;
+			cpu->h = 0x84;
+			cpu->l = 0x03;
+			counter = 0x1830;
+			break;
+		}
+		cpu->f.packed = 0xB0;
 		cpu->e = 0xD8;
 		cpu->h = 1;
 		cpu->l = 0x4D;
@@ -809,6 +818,8 @@ void GBSkipBIOS(struct GB* gb) {
 		if (cpu->b) {
 			// The AGB boot ROM runs a little longer
 			counter += 4;
+		} else if (gb->revision == '0') {
+			counter += 0x20C;
 		}
 		break;
 	}
