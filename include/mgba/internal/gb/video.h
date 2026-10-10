@@ -152,6 +152,7 @@ struct GBVideo {
 
 	union GBOAM oam;
 	int objMax;
+	bool lcdOnLine;
 
 	int bcpIndex;
 	bool bcpIncrement;

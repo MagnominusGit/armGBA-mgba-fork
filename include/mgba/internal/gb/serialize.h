@@ -267,6 +267,7 @@ DECL_BIT(GBSerializedVideoFlags, OcpIncrement, 1);
 DECL_BITS(GBSerializedVideoFlags, Mode, 2, 2);
 DECL_BIT(GBSerializedVideoFlags, NotModeEventScheduled, 4);
 DECL_BIT(GBSerializedVideoFlags, NotFrameEventScheduled, 5);
+DECL_BIT(GBSerializedVideoFlags, LcdOnLine, 6);
 
 DECL_BITFIELD(GBSerializedMBC6Flags, uint8_t);
 DECL_BIT(GBSerializedMBC6Flags, FlashBank0, 0);

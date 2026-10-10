@@ -313,6 +313,7 @@ void GBVideoReset(struct GBVideo* video) {
 	video->ly = 0;
 	video->x = 0;
 	video->mode = 0;
+	video->lcdOnLine = false;
 	video->stat = 0;
 
 	video->frameCounter = 0;
@@ -664,6 +665,10 @@ void _endMode3(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	video->p->memory.io[GB_REG_STAT] = video->stat;
 	// TODO: Cache SCX & 7 in case it changes
 	int32_t next = GB_VIDEO_MODE_0_LENGTH_BASE - video->objMax * 6 - (video->p->memory.io[GB_REG_SCX] & 7);
+	if (video->lcdOnLine) {
+		next -= 3;
+		video->lcdOnLine = false;
+	}
 	mTimingSchedule(timing, &video->modeEvent, (next << 1) - cyclesLate);
 }
 
@@ -731,7 +736,9 @@ void GBVideoWriteLCDC(struct GBVideo* video, GBRegisterLCDC value) {
 	if (!GBRegisterLCDCIsEnable(video->p->memory.io[GB_REG_LCDC]) && GBRegisterLCDCIsEnable(value)) {
 		video->mode = 2;
 		video->modeEvent.callback = _endMode2;
-		int32_t next = GB_VIDEO_MODE_2_LENGTH - 5; // TODO: Why is this fudge factor needed? Might be related to T-cycles for load/store differing
+		// The first line after the LCD turns on starts a little late, and catches up in its HBlank
+		int32_t next = GB_VIDEO_MODE_2_LENGTH - 2;
+		video->lcdOnLine = true;
 		mTimingDeschedule(&video->p->timing, &video->modeEvent);
 		mTimingSchedule(&video->p->timing, &video->modeEvent, next << 1);
 
@@ -1138,6 +1145,7 @@ void GBVideoSerialize(const struct GBVideo* video, struct GBSerializedState* sta
 	flags = GBSerializedVideoFlagsSetMode(flags, video->mode);
 	flags = GBSerializedVideoFlagsSetNotModeEventScheduled(flags, !mTimingIsScheduled(&video->p->timing, &video->modeEvent));
 	flags = GBSerializedVideoFlagsSetNotFrameEventScheduled(flags, !mTimingIsScheduled(&video->p->timing, &video->frameEvent));
+	flags = GBSerializedVideoFlagsSetLcdOnLine(flags, video->lcdOnLine);
 	state->video.flags = flags;
 	STORE_16LE(video->bcpIndex, 0, &state->video.bcpIndex);
 	STORE_16LE(video->ocpIndex, 0, &state->video.ocpIndex);
@@ -1167,6 +1175,7 @@ void GBVideoDeserialize(struct GBVideo* video, const struct GBSerializedState* s
 	video->bcpIncrement = GBSerializedVideoFlagsGetBcpIncrement(flags);
 	video->ocpIncrement = GBSerializedVideoFlagsGetOcpIncrement(flags);
 	video->mode = GBSerializedVideoFlagsGetMode(flags);
+	video->lcdOnLine = GBSerializedVideoFlagsGetLcdOnLine(flags);
 	LOAD_16LE(video->bcpIndex, 0, &state->video.bcpIndex);
 	video->bcpIndex &= 0x3F;
 	LOAD_16LE(video->ocpIndex, 0, &state->video.ocpIndex);
