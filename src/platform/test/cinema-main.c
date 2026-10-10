@@ -9,6 +9,9 @@
 #include <mgba/core/version.h>
 #include <mgba/feature/commandline.h>
 #include <mgba/feature/video-logger.h>
+#ifdef M_CORE_GB
+#include <mgba/internal/sm83/sm83.h>
+#endif
 
 #include <mgba-util/image/png-io.h>
 #include <mgba-util/string.h>
@@ -1073,6 +1076,13 @@ void CInemaTestRun(struct CInemaTest* test) {
 	input = CInemaConfigGet(&configTree, test->name, "input");
 	CInemaConfigLoad(&configTree, test->name, core);
 	MutexUnlock(&configMutex);
+	// The core keeps using the config it loads, so this one lives until the test ends
+	struct mCoreConfig jitConfig;
+	mCoreConfigInit(&jitConfig, NULL);
+	if (getenv("CINEMA_JIT")) {
+		mCoreConfigSetIntValue(&jitConfig, "jit", atoi(getenv("CINEMA_JIT")));
+		core->loadConfig(core, &jitConfig);
+	}
 
 	struct VFile* save = VFileMemChunk(NULL, 0);
 	core->loadROM(core, rom);
@@ -1291,9 +1301,28 @@ void CInemaTestRun(struct CInemaTest* test) {
 		}
 	}
 
+#ifdef M_CORE_GB
+	// Mooneye-style result: Fibonacci registers for a pass, 0x42 for a failure
+	if (getenv("CINEMA_SIGNATURE") && core->platform(core) == mPLATFORM_GB) {
+		unsigned extra = atoi(getenv("CINEMA_SIGNATURE"));
+		for (frame = 0; frame < extra; ++frame) {
+			core->runFrame(core);
+		}
+		struct SM83Core* cpu = core->cpu;
+		const char* signature = "none";
+		if (cpu->b == 3 && cpu->c == 5 && cpu->d == 8 && cpu->e == 13 && cpu->h == 21 && cpu->l == 34) {
+			signature = "pass";
+		} else if (cpu->b == 0x42 && cpu->c == 0x42 && cpu->d == 0x42 && cpu->e == 0x42 && cpu->h == 0x42 && cpu->l == 0x42) {
+			signature = "fail";
+		}
+		fprintf(stderr, "signature %s: %s (bc %04X de %04X hl %04X af %04X pc %04X)\n", test->name, signature, cpu->bc, cpu->de, cpu->hl, cpu->af, cpu->pc);
+	}
+#endif
+
 	free(image.data);
 	mCoreConfigDeinit(&core->config);
 	core->deinit(core);
+	mCoreConfigDeinit(&jitConfig);
 	dir->close(dir);
 }
 

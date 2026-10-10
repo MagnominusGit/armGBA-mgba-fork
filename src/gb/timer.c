@@ -92,31 +92,43 @@ void GBTimerDivReset(struct GBTimer* timer) {
 }
 
 uint8_t GBTimerUpdateTAC(struct GBTimer* timer, GBRegisterTAC tac) {
-	if (GBRegisterTACIsRun(tac)) {
-		timer->nextDiv -= mTimingUntil(&timer->p->timing, &timer->event);
-		mTimingDeschedule(&timer->p->timing, &timer->event);
-		_GBTimerDivIncrement(timer, ((timer->p->cpu->executionState + 2) & 3) * (2 - timer->p->doubleSpeed));
+	int tMultiplier = 2 - timer->p->doubleSpeed;
+	timer->nextDiv -= mTimingUntil(&timer->p->timing, &timer->event);
+	mTimingDeschedule(&timer->p->timing, &timer->event);
+	_GBTimerDivIncrement(timer, ((timer->p->cpu->executionState + 2) & 3) * tMultiplier);
 
+	int timaPeriod = 0;
+	if (GBRegisterTACIsRun(tac)) {
 		switch (GBRegisterTACGetClock(tac)) {
 		case 0:
-			timer->timaPeriod = 1024 >> 4;
+			timaPeriod = 1024 >> 4;
 			break;
 		case 1:
-			timer->timaPeriod = 16 >> 4;
+			timaPeriod = 16 >> 4;
 			break;
 		case 2:
-			timer->timaPeriod = 64 >> 4;
+			timaPeriod = 64 >> 4;
 			break;
 		case 3:
-			timer->timaPeriod = 256 >> 4;
+			timaPeriod = 256 >> 4;
 			break;
 		}
-
-		timer->nextDiv += GB_DMG_DIV_PERIOD * (2 - timer->p->doubleSpeed);
-		mTimingSchedule(&timer->p->timing, &timer->event, timer->nextDiv);
-	} else {
-		timer->timaPeriod = 0;
 	}
+	// TIMA counts falling edges of the selected bit, so stopping it or selecting a clear bit can tick it
+	int counter = (timer->internalDiv << 1) | ((timer->nextDiv >> (4 - timer->p->doubleSpeed)) & 1);
+	if ((counter & timer->timaPeriod) && !(counter & timaPeriod)) {
+		++timer->p->memory.io[GB_REG_TIMA];
+		if (!timer->p->memory.io[GB_REG_TIMA]) {
+			// The write lands a T-cycle into its M-cycle, and TIMA reloads at the end of it
+			mTimingSchedule(&timer->p->timing, &timer->irq, 3 * tMultiplier);
+		}
+	}
+	timer->timaPeriod = timaPeriod;
+
+	// nextDiv is the time since the last DIV step, so the next one is a period after that step
+	int32_t untilStep = GB_DMG_DIV_PERIOD * tMultiplier - timer->nextDiv;
+	timer->nextDiv = GB_DMG_DIV_PERIOD * tMultiplier;
+	mTimingSchedule(&timer->p->timing, &timer->event, untilStep);
 	return tac;
 }
 

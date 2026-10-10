@@ -660,19 +660,20 @@ DEFINE_INSTRUCTION_SM83(DAA,
 		cpu->instruction = _SM83InstructionPOP ## REG ## Delay; \
 		cpu->executionState = SM83_CORE_MEMORY_LOAD;) \
 	DEFINE_INSTRUCTION_SM83(PUSH ## REG ## Finish, \
-		cpu->executionState = SM83_CORE_STALL;) \
-	DEFINE_INSTRUCTION_SM83(PUSH ## REG ## Delay, \
 		--cpu->sp; \
 		cpu->index = cpu->sp; \
 		cpu->bus = cpu-> L; \
-		cpu->instruction = _SM83InstructionPUSH ## REG ## Finish; \
+		cpu->instruction = _SM83InstructionNOP; \
 		cpu->executionState = SM83_CORE_MEMORY_STORE;) \
-	DEFINE_INSTRUCTION_SM83(PUSH ## REG, \
+	DEFINE_INSTRUCTION_SM83(PUSH ## REG ## Delay, \
 		--cpu->sp; \
 		cpu->index = cpu->sp; \
 		cpu->bus = cpu-> H; \
+		cpu->instruction = _SM83InstructionPUSH ## REG ## Finish; \
+		cpu->executionState = SM83_CORE_MEMORY_STORE;) \
+	DEFINE_INSTRUCTION_SM83(PUSH ## REG, \
 		cpu->instruction = _SM83InstructionPUSH ## REG ## Delay; \
-		cpu->executionState = SM83_CORE_MEMORY_STORE;)
+		cpu->executionState = SM83_CORE_OP2;)
 
 DEFINE_POPPUSH_INSTRUCTION_SM83(BC, B, b, c);
 DEFINE_POPPUSH_INSTRUCTION_SM83(DE, D, d, e);

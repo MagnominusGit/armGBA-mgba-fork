@@ -1092,6 +1092,9 @@ void GBHalt(struct SM83Core* cpu) {
 	} else if (!gb->memory.ime) {
 		mLOG(GB, GAME_ERROR, "HALT bug");
 		cpu->executionState = SM83_CORE_HALT_BUG;
+	} else {
+		// The interrupt returns to the HALT, which then runs again
+		--cpu->pc;
 	}
 }
 
