@@ -1136,7 +1136,7 @@ static const struct GBJitOpInfo _ops[0x100] = {
 #define CODE_SIZE (16 * 1024 * 1024)
 #define BLOCK_MAX 64
 #define HOT_THRESHOLD 4
-#define BLOCK_BYTES 192
+#define BLOCK_BYTES 384
 #define INSN_BYTES 192
 #define BAILED 0x10000
 
@@ -1151,6 +1151,7 @@ struct GBJitEntry {
 struct GBJit {
 	struct GB* gb;
 	struct GBJitEntry* bailed;
+	bool noInline;
 	uint8_t* code;
 	size_t used;
 	const uint8_t* rom;
@@ -1320,20 +1321,249 @@ static bool _bails(struct GBJit* jit, size_t offset) {
 	return page && page[offset & 0xFF].bails;
 }
 
+// Native forms of the commonest instructions, with the same registers, flags and latches the handlers leave
+#define FLAG_TABLE_BYTES 256
+#define REG_F offsetof(struct SM83Core, f)
+#define REG_A offsetof(struct SM83Core, a)
+
+static const size_t _regOffsets[8] = {
+	offsetof(struct SM83Core, b), offsetof(struct SM83Core, c), offsetof(struct SM83Core, d), offsetof(struct SM83Core, e),
+	offsetof(struct SM83Core, h), offsetof(struct SM83Core, l), 0, offsetof(struct SM83Core, a)
+};
+
+// opcode with a ModRM operand of [rbx + offset]
+static void _rm(struct Emitter* e, uint8_t opcode, int reg, size_t offset) {
+	_byte(e, opcode);
+	if (offset < 0x80) {
+		_byte(e, 0x43 | (reg << 3));
+		_byte(e, offset);
+	} else {
+		_byte(e, 0x83 | (reg << 3));
+		_word32(e, offset);
+	}
+}
+
+static void _setByte(struct Emitter* e, size_t offset, uint8_t value) {
+	_rm(e, 0xC6, 0, offset);
+	_byte(e, value);
+}
+
+static void _setHalf(struct Emitter* e, size_t offset, uint16_t value) {
+	_byte(e, 0x66);
+	_rm(e, 0xC7, 0, offset);
+	_byte(e, value);
+	_byte(e, value >> 8);
+}
+
+// cl = Z, H and C from the host flags as SM83 flags, through the table at the start of the code buffer
+static void _hostFlags(struct Emitter* e, struct GBJit* jit) {
+	// lahf; movzx ecx, ah; lea rdx, [rip + table]; movzx ecx, byte [rdx + rcx]
+	_byte(e, 0x9F);
+	_byte(e, 0x0F);
+	_byte(e, 0xB6);
+	_byte(e, 0xCC);
+	_byte(e, 0x48);
+	_byte(e, 0x8D);
+	_byte(e, 0x15);
+	_word32(e, (int32_t) (jit->code - (e->p + 4)));
+	_byte(e, 0x0F);
+	_byte(e, 0xB6);
+	_byte(e, 0x0C);
+	_byte(e, 0x0A);
+}
+
+// f = cl | (f & keep)
+static void _mergeFlags(struct Emitter* e, uint8_t keep) {
+	// mov dl, [f]; and dl, keep; or cl, dl; mov [f], cl
+	_rm(e, 0x8A, 2, REG_F);
+	_byte(e, 0x80);
+	_byte(e, 0xE2);
+	_byte(e, keep);
+	_byte(e, 0x08);
+	_byte(e, 0xD1);
+	_rm(e, 0x88, 1, REG_F);
+}
+
+// cl = Z << 7 from the host zero flag
+static void _zeroFlag(struct Emitter* e) {
+	// setz cl; shl cl, 7
+	_byte(e, 0x0F);
+	_byte(e, 0x94);
+	_byte(e, 0xC1);
+	_byte(e, 0xC0);
+	_byte(e, 0xE1);
+	_byte(e, 0x07);
+}
+
+static bool _inline(struct Emitter* e, struct GBJit* jit, const struct Decoded* insn) {
+	if (jit->noInline) {
+		return false;
+	}
+	uint8_t op = insn->opcode;
+	if (op == 0x00) {
+		_setByte(e, offsetof(struct SM83Core, bus), 0x00);
+		return true;
+	}
+	if (op >= 0x40 && op < 0x80 && (op & 7) != 6 && (op & 0x38) != 0x30) {
+		// LD r, r
+		_rm(e, 0x8A, 0, _regOffsets[op & 7]);
+		_rm(e, 0x88, 0, _regOffsets[(op >> 3) & 7]);
+		_setByte(e, offsetof(struct SM83Core, bus), op);
+		return true;
+	}
+	if ((op & 0xC7) == 0x06 && op != 0x36) {
+		// LD r, n
+		_setByte(e, _regOffsets[(op >> 3) & 7], insn->operand);
+		_setByte(e, offsetof(struct SM83Core, bus), insn->operand);
+		return true;
+	}
+	if ((op & 0xC6) == 0x04 && op != 0x34 && op != 0x35) {
+		// INC r / DEC r: carry kept
+		size_t reg = _regOffsets[(op >> 3) & 7];
+		_rm(e, 0x8A, 0, reg);
+		_byte(e, 0xFE);
+		_byte(e, (op & 1) ? 0xC8 : 0xC0);
+		_hostFlags(e, jit);
+		// and cl, Z|H
+		_byte(e, 0x80);
+		_byte(e, 0xE1);
+		_byte(e, 0xA0);
+		if (op & 1) {
+			// or cl, N
+			_byte(e, 0x80);
+			_byte(e, 0xC9);
+			_byte(e, 0x40);
+		}
+		_mergeFlags(e, 0x1F);
+		_rm(e, 0x88, 0, reg);
+		_setByte(e, offsetof(struct SM83Core, bus), op);
+		return true;
+	}
+	bool imm = (op & 0xC7) == 0xC6;
+	if ((op >= 0x80 && op < 0xC0 && (op & 7) != 6) || imm) {
+		// ALU A, r / A, n
+		unsigned alu = (op >> 3) & 7;
+		_rm(e, 0x8A, 0, REG_A);
+		if (imm) {
+			// mov cl, n
+			_byte(e, 0xB1);
+			_byte(e, insn->operand);
+		} else {
+			_rm(e, 0x8A, 1, _regOffsets[op & 7]);
+		}
+		if (alu == 1 || alu == 3) {
+			// bt dword [f], 4: carry in
+			_byte(e, 0x0F);
+			_rm(e, 0xBA, 4, REG_F);
+			_byte(e, 4);
+		}
+		// add, adc, sub, sbb, and, xor, or, cmp al, cl
+		static const uint8_t hostOps[8] = { 0x00, 0x10, 0x28, 0x18, 0x20, 0x30, 0x08, 0x38 };
+		_byte(e, hostOps[alu]);
+		_byte(e, 0xC8);
+		if (alu < 4 || alu == 7) {
+			_hostFlags(e, jit);
+			if (alu >= 2) {
+				// or cl, N
+				_byte(e, 0x80);
+				_byte(e, 0xC9);
+				_byte(e, 0x40);
+			}
+		} else {
+			_zeroFlag(e);
+			if (alu == 4) {
+				// or cl, H
+				_byte(e, 0x80);
+				_byte(e, 0xC9);
+				_byte(e, 0x20);
+			}
+		}
+		_mergeFlags(e, 0x0F);
+		if (alu != 7) {
+			_rm(e, 0x88, 0, REG_A);
+		}
+		_setByte(e, offsetof(struct SM83Core, bus), imm ? insn->operand : op);
+		return true;
+	}
+	if (op == 0xCB && (insn->operand & 0xC0) == 0x40 && (insn->operand & 7) != 6) {
+		// BIT b, r: carry kept
+		_rm(e, 0xF6, 0, _regOffsets[insn->operand & 7]);
+		_byte(e, 1 << ((insn->operand >> 3) & 7));
+		_zeroFlag(e);
+		_byte(e, 0x80);
+		_byte(e, 0xC9);
+		_byte(e, 0x20);
+		_mergeFlags(e, 0x1F);
+		_setByte(e, offsetof(struct SM83Core, bus), insn->operand);
+		return true;
+	}
+	if ((op == 0xF0 || op == 0xE0) && insn->operand >= 0x80 && insn->operand != 0xFF) {
+		// LDH to or from high RAM: [r12 + hram]
+		int32_t hram = offsetof(struct GBMemory, hram) + (insn->operand & 0x7F);
+		if (op == 0xF0) {
+			// mov al, [r12 + hram]; mov [a], al
+			_byte(e, 0x41);
+			_byte(e, 0x8A);
+			_byte(e, 0x84);
+			_byte(e, 0x24);
+			_word32(e, hram);
+			_rm(e, 0x88, 0, REG_A);
+		} else {
+			// mov al, [a]; mov [r12 + hram], al
+			_rm(e, 0x8A, 0, REG_A);
+			_byte(e, 0x41);
+			_byte(e, 0x88);
+			_byte(e, 0x84);
+			_byte(e, 0x24);
+			_word32(e, hram);
+		}
+		_rm(e, 0x88, 0, offsetof(struct SM83Core, bus));
+		_setHalf(e, offsetof(struct SM83Core, index), 0xFF00 | insn->operand);
+		return true;
+	}
+	return false;
+}
+
+// JR and JP to the region the block runs in, so the active region stays as it is
+static bool _inlineBranch(const struct Decoded* insn, uint16_t pc, uint16_t end, uint16_t* target, uint8_t* mask, bool* when) {
+	uint8_t op = insn->opcode;
+	uint16_t next = insn->pc + insn->length;
+	if (op == 0x18 || op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) {
+		*target = next + (int8_t) insn->operand;
+	} else if (op == 0xC3 || op == 0xC2 || op == 0xCA || op == 0xD2 || op == 0xDA) {
+		*target = insn->operand;
+	} else {
+		return false;
+	}
+	if ((*target ^ pc) & GB_SIZE_CART_BANK0 || *target >= end) {
+		return false;
+	}
+	*mask = 0;
+	*when = true;
+	if (op != 0x18 && op != 0xC3) {
+		*mask = (op & 0x10) ? 0x10 : 0x80;
+		*when = (op & 0x08) != 0;
+	}
+	return true;
+}
+
 #define PROLOGUE_BYTES 21
 
 // A direct branch to the same ROM region continues in the target's block when it's compiled, without returning
-static void _chain(struct Emitter* e, struct GBJit* jit, size_t regionOffset, uint16_t pc, uint16_t end, uint16_t target, uint8_t** noLink, int* nNoLink) {
+static void _chain(struct Emitter* e, struct GBJit* jit, size_t regionOffset, uint16_t pc, uint16_t end, uint16_t target, bool compare, uint8_t** noLink, int* nNoLink) {
 	if ((target ^ pc) & GB_SIZE_CART_BANK0 || target >= end) {
 		return;
 	}
 	struct GBJitEntry* entry = _entry(jit, regionOffset + (target & (GB_SIZE_CART_BANK0 - 1)));
-	// cmp eax, target; jne next
-	_byte(e, 0x3D);
-	_word32(e, target);
-	_byte(e, 0x75);
-	uint8_t* next = e->p;
-	_byte(e, 0);
+	uint8_t* next = NULL;
+	if (compare) {
+		// cmp eax, target; jne next
+		_byte(e, 0x3D);
+		_word32(e, target);
+		_byte(e, 0x75);
+		next = e->p;
+		_byte(e, 0);
+	}
 	// mov rcx, &entry; cmp word [rcx + pc], target; jne noLink
 	_byte(e, 0x48);
 	_byte(e, 0xB9);
@@ -1361,7 +1591,70 @@ static void _chain(struct Emitter* e, struct GBJit* jit, size_t regionOffset, ui
 	_byte(e, PROLOGUE_BYTES);
 	_byte(e, 0xFF);
 	_byte(e, 0xE1);
-	*next = e->p - (next + 1);
+	if (next) {
+		*next = e->p - (next + 1);
+	}
+}
+
+// Both ways out of an inlined JR or JP: the latches, pc and cycles, then on into the next block
+static uint8_t* _emitBranch(struct Emitter* e, struct GBJit* jit, const struct Decoded* insn, size_t regionOffset, uint16_t pc, uint16_t end, unsigned prefix, uint16_t target, uint8_t mask, bool when) {
+	bool jp = insn->opcode >= 0xC0;
+	uint16_t next = insn->pc + insn->length;
+	if (jp) {
+		_setHalf(e, offsetof(struct SM83Core, index), insn->operand & 0xFF);
+		_setByte(e, offsetof(struct SM83Core, bus), insn->operand >> 8);
+	} else {
+		_setByte(e, offsetof(struct SM83Core, bus), insn->operand);
+	}
+	uint8_t* notTaken = NULL;
+	if (mask) {
+		// test byte [f], mask; setnz/setz cl; mov [condition], cl; test cl, cl; jz notTaken
+		_rm(e, 0xF6, 0, REG_F);
+		_byte(e, mask);
+		_byte(e, 0x0F);
+		_byte(e, when ? 0x95 : 0x94);
+		_byte(e, 0xC1);
+		_rm(e, 0x88, 1, offsetof(struct SM83Core, condition));
+		_byte(e, 0x84);
+		_byte(e, 0xC9);
+		notTaken = _jcc32(e, 0x84);
+	} else {
+		_setByte(e, offsetof(struct SM83Core, condition), 1);
+	}
+	uint8_t* exit = NULL;
+	int path;
+	for (path = 0; path < (mask ? 2 : 1); ++path) {
+		uint16_t to = path ? next : target;
+		if (path) {
+			_patch(notTaken, e->p);
+		}
+		_storeHalf(e, offsetof(struct SM83Core, pc), to);
+		// mov eax, M-cycles
+		_byte(e, 0xB8);
+		_word32(e, prefix + (path ? (jp ? 3 : 2) : (jp ? 4 : 3)));
+		_addCycles(e);
+		// sub r13d, edx
+		_byte(e, 0x41);
+		_byte(e, 0x29);
+		_byte(e, 0xD5);
+		uint8_t* noLink[2];
+		int nNoLink = 0;
+		_chain(e, jit, regionOffset, pc, end, to, false, noLink, &nNoLink);
+		int k;
+		for (k = 0; k < nNoLink; ++k) {
+			_patch(noLink[k], e->p);
+		}
+		// mov eax, edx
+		_byte(e, 0x89);
+		_byte(e, 0xD0);
+		if (!exit) {
+			exit = e->p;
+			_return(e);
+		} else {
+			_patch(_jmp32(e), exit);
+		}
+	}
+	return exit;
 }
 
 // Blocks end at a branch, at an instruction that has run through the interpreter before, or where code can't be compiled
@@ -1395,6 +1688,7 @@ static void* _compile(struct GBJit* jit, const uint8_t* rom, size_t offset, uint
 	unsigned prefix[BLOCK_MAX];
 	unsigned total = 0;
 	bool anyBail = false;
+	uint8_t* exit = NULL;
 	int i;
 
 	// push rbx; push r12; push r13; mov r13d, esi; mov rbx, rdi; mov r12, &memory
@@ -1428,6 +1722,19 @@ static void* _compile(struct GBJit* jit, const uint8_t* rom, size_t offset, uint
 			// Loads from ROM and jumps out of ROM replace these, so they go first
 			_storeCartBus(&e, insn->lastByte, insn->pc + insn->length - 1);
 		}
+		bails[i] = NULL;
+		ends[i] = NULL;
+		uint16_t target;
+		uint8_t mask;
+		bool when;
+		if ((insn->info->kind & KIND_BRANCH) && !jit->noInline && _inlineBranch(insn, pc, end, &target, &mask, &when)) {
+			exit = _emitBranch(&e, jit, insn, offset - (pc & (GB_SIZE_CART_BANK0 - 1)), pc, end, total, target, mask, when);
+			break;
+		}
+		if (_inline(&e, jit, insn)) {
+			total += insn->info->cycles;
+			continue;
+		}
 		// mov rdi, rbx; mov esi, operand; mov edx, next pc
 		_byte(&e, 0x48);
 		_byte(&e, 0x89);
@@ -1442,8 +1749,6 @@ static void* _compile(struct GBJit* jit, const uint8_t* rom, size_t offset, uint
 			_word32(&e, total + insn->info->cycles - 1);
 		}
 		_call(&e, insn->info->op);
-		bails[i] = NULL;
-		ends[i] = NULL;
 		if (insn->info->kind & (KIND_LOAD | KIND_STORE)) {
 			// test eax, eax; js bail
 			_byte(&e, 0x85);
@@ -1457,54 +1762,56 @@ static void* _compile(struct GBJit* jit, const uint8_t* rom, size_t offset, uint
 		}
 		total += insn->info->cycles;
 	}
-	const struct Decoded* last = &insns[n - 1];
-	if (last->info->kind & KIND_BRANCH) {
-		// add eax, prefix
-		_byte(&e, 0x05);
-		_word32(&e, total);
-	} else {
-		if (!(last->info->kind & KIND_LOAD)) {
-			_storeCartBus(&e, last->lastByte, last->pc + last->length - 1);
+	if (!exit) {
+		const struct Decoded* last = &insns[n - 1];
+		if (last->info->kind & KIND_BRANCH) {
+			// add eax, prefix
+			_byte(&e, 0x05);
+			_word32(&e, total);
+		} else {
+			if (!(last->info->kind & KIND_LOAD)) {
+				_storeCartBus(&e, last->lastByte, last->pc + last->length - 1);
+			}
+			_storeHalf(&e, offsetof(struct SM83Core, pc), last->pc + last->length);
+			// mov eax, total
+			_byte(&e, 0xB8);
+			_word32(&e, total);
 		}
-		_storeHalf(&e, offsetof(struct SM83Core, pc), last->pc + last->length);
-		// mov eax, total
-		_byte(&e, 0xB8);
-		_word32(&e, total);
+		_addCycles(&e);
+		if (last->info->kind & KIND_BRANCH) {
+			// sub r13d, edx; movzx eax, word [rbx + pc]
+			_byte(&e, 0x41);
+			_byte(&e, 0x29);
+			_byte(&e, 0xD5);
+			_byte(&e, 0x0F);
+			_byte(&e, 0xB7);
+			_byte(&e, 0x83);
+			_word32(&e, offsetof(struct SM83Core, pc));
+			uint8_t* noLink[4];
+			int nNoLink = 0;
+			size_t regionOffset = offset - (pc & (GB_SIZE_CART_BANK0 - 1));
+			uint16_t next = last->pc + last->length;
+			uint8_t op = last->opcode;
+			if (op == 0xC3 || op == 0xC2 || op == 0xCA || op == 0xD2 || op == 0xDA || op == 0xCD || op == 0xC4 || op == 0xCC || op == 0xD4 || op == 0xDC) {
+				_chain(&e, jit, regionOffset, pc, end, last->operand, true, noLink, &nNoLink);
+			} else if (op == 0x18 || op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) {
+				_chain(&e, jit, regionOffset, pc, end, next + (int8_t) last->operand, true, noLink, &nNoLink);
+			} else if ((op & 0xC7) == 0xC7) {
+				_chain(&e, jit, regionOffset, pc, end, op & 0x38, true, noLink, &nNoLink);
+			}
+			if (op != 0xC3 && op != 0x18 && op != 0xCD && op != 0xC9 && op != 0xE9 && (op & 0xC7) != 0xC7) {
+				_chain(&e, jit, regionOffset, pc, end, next, true, noLink, &nNoLink);
+			}
+			for (i = 0; i < nNoLink; ++i) {
+				_patch(noLink[i], e.p);
+			}
+		}
+		// mov eax, edx
+		_byte(&e, 0x89);
+		_byte(&e, 0xD0);
+		exit = e.p;
+		_return(&e);
 	}
-	_addCycles(&e);
-	if (last->info->kind & KIND_BRANCH) {
-		// sub r13d, edx; movzx eax, word [rbx + pc]
-		_byte(&e, 0x41);
-		_byte(&e, 0x29);
-		_byte(&e, 0xD5);
-		_byte(&e, 0x0F);
-		_byte(&e, 0xB7);
-		_byte(&e, 0x83);
-		_word32(&e, offsetof(struct SM83Core, pc));
-		uint8_t* noLink[4];
-		int nNoLink = 0;
-		size_t regionOffset = offset - (pc & (GB_SIZE_CART_BANK0 - 1));
-		uint16_t next = last->pc + last->length;
-		uint8_t op = last->opcode;
-		if (op == 0xC3 || op == 0xC2 || op == 0xCA || op == 0xD2 || op == 0xDA || op == 0xCD || op == 0xC4 || op == 0xCC || op == 0xD4 || op == 0xDC) {
-			_chain(&e, jit, regionOffset, pc, end, last->operand, noLink, &nNoLink);
-		} else if (op == 0x18 || op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) {
-			_chain(&e, jit, regionOffset, pc, end, next + (int8_t) last->operand, noLink, &nNoLink);
-		} else if ((op & 0xC7) == 0xC7) {
-			_chain(&e, jit, regionOffset, pc, end, op & 0x38, noLink, &nNoLink);
-		}
-		if (op != 0xC3 && op != 0x18 && op != 0xCD && op != 0xC9 && op != 0xE9 && (op & 0xC7) != 0xC7) {
-			_chain(&e, jit, regionOffset, pc, end, next, noLink, &nNoLink);
-		}
-		for (i = 0; i < nNoLink; ++i) {
-			_patch(noLink[i], e.p);
-		}
-	}
-	// mov eax, edx
-	_byte(&e, 0x89);
-	_byte(&e, 0xD0);
-	uint8_t* exit = e.p;
-	_return(&e);
 	uint8_t* tail = e.p;
 	_addCycles(&e);
 	_patch(_jmp32(&e), exit);
@@ -1570,9 +1877,104 @@ void GBJitFlush(struct GBJit* jit) {
 	free(jit->pages);
 	jit->pages = NULL;
 	jit->nPages = 0;
-	jit->used = 0;
+	jit->used = FLAG_TABLE_BYTES;
 	jit->rom = NULL;
 	jit->romSize = 0;
+}
+
+// Every inlined instruction against its handler, from random machine states
+static void _selfTest(struct GBJit* jit, unsigned iterations) {
+	struct SM83Core* cpu = jit->gb->cpu;
+	struct GBMemory* memory = &jit->gb->memory;
+	struct SM83Core saved = *cpu;
+	uint8_t savedHram[GB_SIZE_HRAM + 1];
+	memcpy(savedHram, memory->hram, sizeof(savedHram));
+	uint8_t savedBus = memory->cartBus;
+	uint16_t savedBusPc = memory->cartBusPc;
+	static uint8_t rom[GB_SIZE_CART_BANK0];
+	jit->nPages = GB_SIZE_CART_BANK0 >> 8;
+	jit->pages = calloc(jit->nPages, sizeof(*jit->pages));
+	uint32_t seed = 1;
+	unsigned tested = 0, failures = 0;
+	int op;
+	for (op = 0; op < 0x200; ++op) {
+		uint8_t scratch[1024];
+		struct Emitter probe = { scratch };
+		struct Decoded insn;
+		rom[0x100] = op < 0x100 ? op : 0xCB;
+		rom[0x101] = op < 0x100 ? 0x90 : op;
+		rom[0x102] = 0x01;
+		if (!_decode(&rom[0x100], 0x100, GB_SIZE_CART_BANK0, &insn)) {
+			continue;
+		}
+		// HALT ends the block after the one instruction
+		rom[0x100 + insn.length] = 0x76;
+		uint16_t target;
+		uint8_t mask;
+		bool when;
+		if (!_inline(&probe, jit, &insn) && !((insn.info->kind & KIND_BRANCH) && _inlineBranch(&insn, 0x100, GB_SIZE_CART_BANK0, &target, &mask, &when))) {
+			continue;
+		}
+		unsigned k;
+		for (k = 0; k < iterations; ++k) {
+			struct SM83Core states[2];
+			uint8_t hram[2][GB_SIZE_HRAM + 1];
+			uint8_t bus[2];
+			uint16_t busPc[2];
+			uint8_t random[16];
+			unsigned b;
+			for (b = 0; b < sizeof(random); ++b) {
+				seed = seed * 1103515245 + 12345;
+				random[b] = seed >> 16;
+			}
+			if (op < 0x100 && insn.length > 1) {
+				rom[0x101] = random[12];
+			}
+			if (insn.length > 2) {
+				rom[0x102] = random[13] & 0x3F;
+			}
+			int which;
+			for (which = 0; which < 2; ++which) {
+				bool full = false;
+				jit->used = FLAG_TABLE_BYTES;
+				jit->noInline = !which;
+				void* block = _compile(jit, &rom[0x100], 0x100, 0x100, GB_SIZE_CART_BANK0, &full);
+				jit->noInline = false;
+				*cpu = saved;
+				memcpy(&cpu->regs, random, 8);
+				cpu->sp = random[8] | (random[9] << 8);
+				cpu->pc = 0x100;
+				cpu->bus = random[10];
+				cpu->index = random[11] | (random[14] << 8);
+				cpu->condition = random[15] & 1;
+				cpu->cycles = 0;
+				cpu->nextEvent = 1000;
+				memcpy(memory->hram, random, 16);
+				memory->hram[0x7E] = random[3];
+				((int (*)(struct SM83Core*, int)) block)(cpu, 100);
+				states[which] = *cpu;
+				memcpy(hram[which], memory->hram, sizeof(hram[which]));
+				bus[which] = memory->cartBus;
+				busPc[which] = memory->cartBusPc;
+			}
+			++tested;
+			if (memcmp(&states[0].regs, &states[1].regs, sizeof(states[0].regs)) || states[0].index != states[1].index ||
+			    states[0].bus != states[1].bus || states[0].condition != states[1].condition || states[0].cycles != states[1].cycles ||
+			    memcmp(hram[0], hram[1], sizeof(hram[0])) || bus[0] != bus[1] || busPc[0] != busPc[1]) {
+				if (failures++ < 8) {
+					fprintf(stderr, "GB JIT self-test: %s%02X differs (af %04X/%04X bc %04X/%04X hl %04X/%04X pc %04X/%04X bus %02X/%02X)\n",
+					        op < 0x100 ? "" : "CB ", op & 0xFF, states[0].af, states[1].af, states[0].bc, states[1].bc, states[0].hl, states[1].hl,
+					        states[0].pc, states[1].pc, states[0].bus, states[1].bus);
+				}
+			}
+		}
+	}
+	*cpu = saved;
+	memcpy(memory->hram, savedHram, sizeof(savedHram));
+	memory->cartBus = savedBus;
+	memory->cartBusPc = savedBusPc;
+	GBJitFlush(jit);
+	fprintf(stderr, "GB JIT self-test: %u instructions, %u failures\n", tested, failures);
 }
 
 struct GBJit* GBJitCreate(struct GB* gb) {
@@ -1601,6 +2003,14 @@ struct GBJit* GBJitCreate(struct GB* gb) {
 	if (jit->code == MAP_FAILED) {
 		free(jit);
 		return NULL;
+	}
+	// SM83 Z, H and C for each value of the host flags as LAHF leaves them
+	for (i = 0; i < FLAG_TABLE_BYTES; ++i) {
+		jit->code[i] = ((i & 0x40) << 1) | ((i & 0x10) << 1) | ((i & 0x01) << 4);
+	}
+	jit->used = FLAG_TABLE_BYTES;
+	if (getenv("MGBA_JIT_SELFTEST")) {
+		_selfTest(jit, atoi(getenv("MGBA_JIT_SELFTEST")));
 	}
 	return jit;
 }
@@ -1661,7 +2071,7 @@ static bool _runBlock(struct SM83Core* cpu, struct GBJit* jit) {
 	}
 	int t = cpu->tMultiplier;
 	// Instructions run while all their M-cycles end before the next event, as the interpreter checks after each one
-	int budget = (cpu->nextEvent - cpu->cycles + t - 1) / (4 * t);
+	int budget = (cpu->nextEvent - cpu->cycles + t - 1) >> (t + 1);
 	if (budget <= 0) {
 		return false;
 	}
